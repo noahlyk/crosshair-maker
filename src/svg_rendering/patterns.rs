@@ -15,6 +15,7 @@ pub fn offset_piece(piece: &Piece, dx: i32, dy: i32) -> Piece {
             lock_all,
             rotation,
             center_dot,
+            hard_edges,
         } => {
             let (ox, oy) = *origin;
             Piece::Cross {
@@ -39,6 +40,7 @@ pub fn offset_piece(piece: &Piece, dx: i32, dy: i32) -> Piece {
                 lock_all: *lock_all,
                 rotation: *rotation,
                 center_dot: *center_dot,
+                hard_edges: *hard_edges,
             }
         }
         Piece::Dot {

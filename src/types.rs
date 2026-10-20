@@ -485,6 +485,9 @@ pub enum Piece {
         /// Draw a dot at the center, with the gap separating it from the arms.
         #[serde(default)]
         center_dot: bool,
+        /// Render rotated arms with hard (non anti-aliased) pixel edges.
+        #[serde(default)]
+        hard_edges: bool,
     },
     Dot {
         origin: (i32, i32),
@@ -813,6 +816,7 @@ pub fn default_pieces() -> Vec<Piece> {
             lock_all: true,
             rotation: 0.0,
             center_dot: false,
+            hard_edges: false,
         },
         HappyFace {
             origin: (-50, -10),
@@ -848,6 +852,7 @@ pub fn default_cross_piece() -> Piece {
         lock_all: true,
         rotation: 0.0,
         center_dot: false,
+            hard_edges: false,
     }
 }
 
