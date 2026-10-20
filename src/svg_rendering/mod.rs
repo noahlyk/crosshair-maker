@@ -90,6 +90,20 @@ pub(crate) fn apply_color(color: &str) -> String {
     format!("fill=\"{color}\"")
 }
 
+/// Bounding box of an axis-aligned box after rotating it by `deg` degrees
+/// around `(px, py)`.  Returns `(min_x, max_x, min_y, max_y)`.
+fn rotate_bounds(px: f64, py: f64, deg: f64, x0: f64, x1: f64, y0: f64, y1: f64) -> (f64, f64, f64, f64) {
+    let (sin_r, cos_r) = deg.to_radians().sin_cos();
+    let mut out = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+    for (x, y) in [(x0, y0), (x1, y0), (x1, y1), (x0, y1)] {
+        let (dx, dy) = (x - px, y - py);
+        let rx = px + dx * cos_r - dy * sin_r;
+        let ry = py + dx * sin_r + dy * cos_r;
+        out = (out.0.min(rx), out.1.max(rx), out.2.min(ry), out.3.max(ry));
+    }
+    out
+}
+
 // ── public API ──────────────────────────────────────────────────────
 
 pub use patterns::{expand_pieces, offset_piece};
@@ -137,6 +151,21 @@ let (ax, ay) = piece.odd_anchor().offset();
                 max_x = max_x.max(ox as f64 + right_reach + right_thick_pos).max(ox as f64 + right_thick_pos);
                 min_y = min_y.min(-(oy as f64) - top_reach - top_thick_neg).min(-(oy as f64) - top_thick_neg);
                 max_y = max_y.max(-(oy as f64) + bot_reach + bottom_thick_pos).max(-(oy as f64) + bottom_thick_pos);
+                if let Piece::Cross { rotation, .. } = piece {
+                    if *rotation != 0.0 {
+                        let (x0, x1, y0, y1) = rotate_bounds(
+                            ox as f64, -(oy as f64), *rotation,
+                            (ox as f64 - left_reach - left_thick_neg).min(ox as f64 - left_thick_neg),
+                            (ox as f64 + right_reach + right_thick_pos).max(ox as f64 + right_thick_pos),
+                            (-(oy as f64) - top_reach - top_thick_neg).min(-(oy as f64) - top_thick_neg),
+                            (-(oy as f64) + bot_reach + bottom_thick_pos).max(-(oy as f64) + bottom_thick_pos),
+                        );
+                        min_x = min_x.min(x0);
+                        max_x = max_x.max(x1);
+                        min_y = min_y.min(y0);
+                        max_y = max_y.max(y1);
+                    }
+                }
             }
             Piece::Dot { origin, size, .. } => {
                 let s = size.cast_signed();
@@ -357,6 +386,21 @@ fn extent_of_primitive(
             *max_x = max_x.max(ox as f64 + right_reach + right_thick_pos).max(ox as f64 + right_thick_pos);
             *min_y = min_y.min(-(oy as f64) - top_reach - top_thick_neg).min(-(oy as f64) - top_thick_neg);
             *max_y = max_y.max(-(oy as f64) + bot_reach + bottom_thick_pos).max(-(oy as f64) + bottom_thick_pos);
+            if let Piece::Cross { rotation, .. } = piece {
+                if *rotation != 0.0 {
+                    let (x0, x1, y0, y1) = rotate_bounds(
+                        ox as f64, -(oy as f64), *rotation,
+                        (ox as f64 - left_reach - left_thick_neg).min(ox as f64 - left_thick_neg),
+                        (ox as f64 + right_reach + right_thick_pos).max(ox as f64 + right_thick_pos),
+                        (-(oy as f64) - top_reach - top_thick_neg).min(-(oy as f64) - top_thick_neg),
+                        (-(oy as f64) + bot_reach + bottom_thick_pos).max(-(oy as f64) + bottom_thick_pos),
+                    );
+                    *min_x = min_x.min(x0);
+                    *max_x = max_x.max(x1);
+                    *min_y = min_y.min(y0);
+                    *max_y = max_y.max(y1);
+                }
+            }
         }
         Piece::HappyFace { origin, size, .. } => {
             let (ox, oy) = *origin;
