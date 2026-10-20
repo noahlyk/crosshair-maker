@@ -479,6 +479,12 @@ pub enum Piece {
         lock_gap: bool,
         #[serde(default = "default_true")]
         lock_all: bool,
+        /// Rotation in degrees around the cross center (45 turns + into x).
+        #[serde(default)]
+        rotation: f64,
+        /// Draw a dot at the center, with the gap separating it from the arms.
+        #[serde(default)]
+        center_dot: bool,
     },
     Dot {
         origin: (i32, i32),
@@ -805,6 +811,8 @@ pub fn default_pieces() -> Vec<Piece> {
             odd_anchor: OddAnchor::default(),
             lock_gap: true,
             lock_all: true,
+            rotation: 0.0,
+            center_dot: false,
         },
         HappyFace {
             origin: (-50, -10),
@@ -838,6 +846,8 @@ pub fn default_cross_piece() -> Piece {
         odd_anchor: OddAnchor::default(),
         lock_gap: true,
         lock_all: true,
+        rotation: 0.0,
+        center_dot: false,
     }
 }
 

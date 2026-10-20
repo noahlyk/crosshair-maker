@@ -66,7 +66,7 @@ pub fn edit_piece(ui: &mut egui::Ui, piece: &mut Piece, effects: &mut DynamicEff
 let mut changed = false;
     match piece {
         Piece::Cross {
-            origin, color, color_type, odd_anchor, lock_all, lock_gap,
+            origin, color, color_type, odd_anchor, lock_all, lock_gap, rotation, center_dot,
             left_gap, right_gap, top_gap, bottom_gap,
             left_thickness, right_thickness, top_thickness, bottom_thickness,
             left_length, right_length, top_length, bottom_length,
@@ -74,6 +74,8 @@ let mut changed = false;
         } => {
             ui.label("Cross");
             changed |= edit_origin(ui, origin);
+            changed |= slider_f64(ui, rotation, -360.0..=360.0, "Rotation");
+            changed |= ui.checkbox(center_dot, "Center Dot").changed();
 
             // Lock All: main control - when checked, all 4 sides sync to one value
             if ui.checkbox(lock_all, "Lock All").changed() {
@@ -313,7 +315,7 @@ fn default_piece_of_type(name: &str) -> Piece {
             left_thickness: 2, right_thickness: 2, top_thickness: 2, bottom_thickness: 2,
             left_length: 4, right_length: 4, top_length: 4, bottom_length: 4,
             color: "#00ff7dff".to_string(), color_type: default_color_type,
-            visible: true, odd_anchor: OddAnchor::default(), lock_gap: true, lock_all: true,
+            visible: true, odd_anchor: OddAnchor::default(), lock_gap: true, lock_all: true, rotation: 0.0, center_dot: false,
         },
         "HappyFace" => Piece::HappyFace {
             origin: (0, 0), size: 3, color: "#00ff7dff".to_string(),
