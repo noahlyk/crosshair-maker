@@ -396,6 +396,7 @@ pub fn render_pieces_panel(
             lock_all: true,
             rotation: 0.0,
             center_dot: false,
+            hard_edges: false,
         });
         selected_indices.clear();
         selected_indices.push(pieces.len() - 1);
