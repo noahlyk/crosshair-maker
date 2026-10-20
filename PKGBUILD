@@ -1,10 +1,10 @@
-# Maintainer: fibsussy <fibsussy@tuta.io>
+# Maintainer: noahlyk <noahlykins@gmail.com>
 pkgname=crosshair-maker
 pkgver=0.6.2
 pkgrel=1
 pkgdesc="Crosshair overlay creator with SVG rendering and preview"
 arch=('x86_64' 'aarch64')
-url="https://github.com/fibsussy/crosshair-maker"
+url="https://github.com/noahlyk/crosshair-maker"
 license=('GPL-3.0-only')
 depends=('libx11' 'libxcb' 'wayland' 'libxkbcommon' 'vulkan-icd-loader')
 makedepends=('rust' 'cargo')
