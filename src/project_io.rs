@@ -116,7 +116,18 @@ pub fn load_project(path: &PathBuf) -> Result<CrosshairProject, String> {
     for piece in &mut project.pieces {
         migrate_cross_piece(piece);
     }
-    
+
+    // Stable piece ids (links point at them) and the pre-per-piece-effects
+    // group format.
+    crate::links::assign_uids(&mut project.pieces);
+    let mut legacy: Vec<crate::types::DynamicEffects> = std::mem::take(&mut project.dynamic_groups);
+    if legacy.is_empty() {
+        legacy.extend(project.dynamic_effects.take());
+    }
+    if !legacy.is_empty() {
+        crate::links::migrate_legacy_groups(&mut project.pieces, &legacy);
+    }
+
     Ok(project)
 }
 

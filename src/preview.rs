@@ -1302,6 +1302,7 @@ mod layering_tests {
             if let Piece::Cross { color_type, .. } = &mut p {
                 *color_type = ColorType::Dynamic {
                     group,
+                    effects: Default::default(),
                     _legacy_mode: None,
                     _legacy_modes: None,
                     _legacy_tint: None,

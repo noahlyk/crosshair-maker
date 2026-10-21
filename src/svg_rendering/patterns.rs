@@ -1,167 +1,23 @@
 use crate::types::Piece;
 
 pub fn offset_piece(piece: &Piece, dx: i32, dy: i32) -> Piece {
-    match piece {
-        Piece::Cross {
-            origin,
-            left_gap, right_gap, top_gap, bottom_gap,
-            left_thickness, right_thickness, top_thickness, bottom_thickness,
-            left_length, right_length, top_length, bottom_length,
-            color,
-            color_type,
-            visible,
-            odd_anchor,
-            lock_gap,
-            lock_all,
-            rotation,
-            center_dot,
-            hard_edges,
-        } => {
-            let (ox, oy) = *origin;
-            Piece::Cross {
-                origin: (ox + dx, oy + dy),
-                left_gap: *left_gap,
-                right_gap: *right_gap,
-                top_gap: *top_gap,
-                bottom_gap: *bottom_gap,
-                left_thickness: *left_thickness,
-                right_thickness: *right_thickness,
-                top_thickness: *top_thickness,
-                bottom_thickness: *bottom_thickness,
-                left_length: *left_length,
-                right_length: *right_length,
-                top_length: *top_length,
-                bottom_length: *bottom_length,
-                color: color.clone(),
-                color_type: color_type.clone(),
-                visible: *visible,
-                odd_anchor: *odd_anchor,
-                lock_gap: *lock_gap,
-                lock_all: *lock_all,
-                rotation: *rotation,
-                center_dot: *center_dot,
-                hard_edges: *hard_edges,
-            }
+    let mut p = piece.clone();
+    match &mut p {
+        Piece::Cross { origin, .. }
+        | Piece::Dot { origin, .. }
+        | Piece::Line { origin, .. }
+        | Piece::Rectangle { origin, .. }
+        | Piece::HappyFace { origin, .. } => {
+            origin.0 += dx;
+            origin.1 += dy;
         }
-        Piece::Dot {
-            origin,
-            size,
-            color,
-            color_type,
-            visible,
-            odd_anchor,
-        } => {
-            let (ox, oy) = *origin;
-            Piece::Dot {
-                origin: (ox + dx, oy + dy),
-                size: *size,
-                color: color.clone(),
-                color_type: color_type.clone(),
-                visible: *visible,
-                odd_anchor: *odd_anchor,
-            }
-        }
-        Piece::Line {
-            origin,
-            vector,
-            thickness,
-            color,
-            color_type,
-            visible,
-            odd_anchor,
-            anti_aliasing,
-        } => {
-            let (ox, oy) = *origin;
-            Piece::Line {
-                origin: (ox + dx, oy + dy),
-                vector: *vector,
-                thickness: *thickness,
-                color: color.clone(),
-                color_type: color_type.clone(),
-                visible: *visible,
-                odd_anchor: *odd_anchor,
-                anti_aliasing: *anti_aliasing,
-            }
-        }
-        Piece::Rectangle {
-            origin,
-            width,
-            height,
-            rotation,
-            color,
-            color_type,
-            visible,
-            odd_anchor,
-        } => {
-            let (ox, oy) = *origin;
-            Piece::Rectangle {
-                origin: (ox + dx, oy + dy),
-                width: *width,
-                height: *height,
-                rotation: *rotation,
-                color: color.clone(),
-                color_type: color_type.clone(),
-                visible: *visible,
-                odd_anchor: *odd_anchor,
-            }
-        }
-        Piece::RectPattern {
-            origin,
-            x_distance,
-            x_quantity,
-            y_distance,
-            y_quantity,
-            obj,
-            visible,
-        } => {
-            let (ox, oy) = *origin;
-            Piece::RectPattern {
-                origin: (ox + dx, oy + dy),
-                x_distance: *x_distance,
-                x_quantity: *x_quantity,
-                y_distance: *y_distance,
-                y_quantity: *y_quantity,
-                obj: Box::new(offset_piece(obj, dx, dy)),
-                visible: *visible,
-            }
-        }
-        Piece::CircPattern {
-            origin,
-            radius,
-            quantity,
-            start_deg,
-            obj,
-            visible,
-        } => {
-            let (ox, oy) = *origin;
-            Piece::CircPattern {
-                origin: (ox + dx, oy + dy),
-                radius: *radius,
-                quantity: *quantity,
-                start_deg: *start_deg,
-                obj: Box::new(offset_piece(obj, dx, dy)),
-                visible: *visible,
-            }
-        }
-        Piece::HappyFace {
-            origin,
-            size,
-            color,
-            color_type,
-            visible,
-            odd_anchor,
-        } => {
-            let (ox, oy) = *origin;
-            Piece::HappyFace {
-                origin: (ox + dx, oy + dy),
-                size: *size,
-                color: color.clone(),
-                color_type: color_type.clone(),
-                visible: *visible,
-                odd_anchor: *odd_anchor,
-            }
+        Piece::RectPattern { origin, obj, .. } | Piece::CircPattern { origin, obj, .. } => {
+            origin.0 += dx;
+            origin.1 += dy;
+            **obj = offset_piece(obj, dx, dy);
         }
     }
+    p
 }
 
 fn collect_pattern_pieces(piece: &Piece, pieces: &mut Vec<Piece>) {

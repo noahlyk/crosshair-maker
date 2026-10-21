@@ -1,6 +1,6 @@
 use eframe::egui;
 
-use crate::types::{OddAnchor, Piece, DynamicEffects, MAX_DYNAMIC_GROUPS};
+use crate::types::{ColorType, DynamicEffects, LinkTarget, OddAnchor, Piece};
 
 fn slider_i32(ui: &mut egui::Ui, val: &mut i32, range: std::ops::RangeInclusive<i32>, label: &str) -> bool {
     ui.add(egui::Slider::new(val, range).text(label).step_by(1.0).clamping(egui::SliderClamping::Always)).changed()
@@ -62,7 +62,7 @@ fn edit_odd_anchor(ui: &mut egui::Ui, anchor: &mut OddAnchor) -> bool {
     }
 }
 
-pub fn edit_piece(ui: &mut egui::Ui, piece: &mut Piece, groups: &mut Vec<DynamicEffects>) -> bool {
+pub fn edit_piece(ui: &mut egui::Ui, piece: &mut Piece, choices: &[LinkChoice]) -> bool {
 let mut changed = false;
     match piece {
         Piece::Cross {
@@ -202,7 +202,7 @@ let mut changed = false;
             }
 
             ui.separator();
-            changed |= edit_color_section(ui, color, color_type, groups);
+            changed |= edit_color_section(ui, color, color_type, choices);
             ui.separator();
             changed |= edit_odd_anchor(ui, odd_anchor);
         }
@@ -211,7 +211,7 @@ let mut changed = false;
             changed |= edit_origin(ui, origin);
             changed |= slider_u32(ui, size, 1..=100, "Size");
             ui.separator();
-            changed |= edit_color_section(ui, color, color_type, groups);
+            changed |= edit_color_section(ui, color, color_type, choices);
             ui.separator();
             changed |= edit_odd_anchor(ui, odd_anchor);
         }
@@ -227,7 +227,7 @@ let mut changed = false;
             changed |= slider_i32(ui, thickness, 1..=50, "Thickness");
             ui.checkbox(anti_aliasing, "Anti-aliasing");
             ui.separator();
-            changed |= edit_color_section(ui, color, color_type, groups);
+            changed |= edit_color_section(ui, color, color_type, choices);
             ui.separator();
             changed |= edit_odd_anchor(ui, odd_anchor);
         }
@@ -238,7 +238,7 @@ let mut changed = false;
             changed |= slider_u32(ui, height, 1..=500, "Height");
             changed |= slider_f64(ui, rotation, -360.0..=360.0, "Rotation");
             ui.separator();
-            changed |= edit_color_section(ui, color, color_type, groups);
+            changed |= edit_color_section(ui, color, color_type, choices);
             ui.separator();
             changed |= edit_odd_anchor(ui, odd_anchor);
         }
@@ -252,7 +252,7 @@ let mut changed = false;
             ui.separator();
             ui.label("Inner piece:");
             changed |= edit_piece_type_selector(ui, obj);
-            changed |= edit_piece(ui, obj, groups);
+            changed |= edit_piece(ui, obj, choices);
         }
         Piece::CircPattern { origin, radius, quantity, start_deg, obj, .. } => {
             ui.label("CircPattern");
@@ -263,14 +263,14 @@ let mut changed = false;
             ui.separator();
             ui.label("Inner piece:");
             changed |= edit_piece_type_selector(ui, obj);
-            changed |= edit_piece(ui, obj, groups);
+            changed |= edit_piece(ui, obj, choices);
         }
         Piece::HappyFace { origin, size, color, color_type, odd_anchor, .. } => {
             ui.label("HappyFace");
             changed |= edit_origin(ui, origin);
             changed |= slider_u32(ui, size, 1..=100, "Size");
             ui.separator();
-            changed |= edit_color_section(ui, color, color_type, groups);
+            changed |= edit_color_section(ui, color, color_type, choices);
             ui.separator();
             changed |= edit_odd_anchor(ui, odd_anchor);
         }
@@ -296,23 +296,26 @@ fn edit_piece_type_selector(ui: &mut egui::Ui, obj: &mut Box<Piece>) -> bool {
 }
 
 fn default_piece_of_type(name: &str) -> Piece {
-    use crate::types::ColorType;
-    let default_color_type = ColorType::default();
+        let default_color_type = ColorType::default();
     match name {
         "Dot" => Piece::Dot {
+            uid: 0,
             origin: (0, 0), size: 2, color: "#ff5050ff".to_string(),
             color_type: default_color_type, visible: true, odd_anchor: OddAnchor::default(),
         },
         "Line" => Piece::Line {
+            uid: 0,
             origin: (0, 0), vector: (10, 0), thickness: 2, color: "#ffffffff".to_string(),
             color_type: default_color_type, visible: true, odd_anchor: OddAnchor::default(),
             anti_aliasing: false,
         },
         "Rectangle" => Piece::Rectangle {
+            uid: 0,
             origin: (0, 0), width: 10, height: 10, rotation: 0.0, color: "#ffffffff".to_string(),
             color_type: default_color_type, visible: true, odd_anchor: OddAnchor::default(),
         },
         "Cross" => Piece::Cross {
+            uid: 0,
             origin: (0, 0),
             left_gap: 2, right_gap: 2, top_gap: 2, bottom_gap: 2,
             left_thickness: 2, right_thickness: 2, top_thickness: 2, bottom_thickness: 2,
@@ -321,10 +324,12 @@ fn default_piece_of_type(name: &str) -> Piece {
             visible: true, odd_anchor: OddAnchor::default(), lock_gap: true, lock_all: true, rotation: 0.0, center_dot: false, hard_edges: false,
         },
         "HappyFace" => Piece::HappyFace {
+            uid: 0,
             origin: (0, 0), size: 3, color: "#00ff7dff".to_string(),
             color_type: default_color_type, visible: true, odd_anchor: OddAnchor::default(),
         },
         _ => Piece::Dot {
+            uid: 0,
             origin: (0, 0), size: 2, color: "#ffffffff".to_string(),
             color_type: default_color_type, visible: true, odd_anchor: OddAnchor::default(),
         },
@@ -346,19 +351,18 @@ pub fn edit_color(ui: &mut egui::Ui, color: &mut String) -> bool {
     changed
 }
 
-use crate::types::ColorType;
 
 /// Unified color section: color type dropdown, base color (when applicable), and sub-properties.
-fn edit_color_section(ui: &mut egui::Ui, color: &mut String, color_type: &mut ColorType, groups: &mut Vec<DynamicEffects>) -> bool {
+fn edit_color_section(ui: &mut egui::Ui, color: &mut String, color_type: &mut ColorType, choices: &[LinkChoice]) -> bool {
     let mut changed = false;
-    changed |= edit_color_type(ui, color_type, groups);
+    changed |= edit_color_type(ui, color_type, choices);
     if matches!(color_type, ColorType::Solid) {
         changed |= edit_color(ui, color);
     }
     changed
 }
 
-pub fn edit_color_type(ui: &mut egui::Ui, color_type: &mut ColorType, groups: &mut Vec<DynamicEffects>) -> bool {
+pub fn edit_color_type(ui: &mut egui::Ui, color_type: &mut ColorType, choices: &[LinkChoice]) -> bool {
     let mut changed = false;
 
     let mut selected_idx = match *color_type {
@@ -367,6 +371,7 @@ pub fn edit_color_type(ui: &mut egui::Ui, color_type: &mut ColorType, groups: &m
         ColorType::Rainbow { .. } => 2,
         ColorType::GradientCycle { .. } => 3,
         ColorType::Dynamic { .. } => 4,
+        ColorType::Link { .. } => 5,
     };
 
     ui.horizontal(|ui| {
@@ -378,6 +383,7 @@ pub fn edit_color_type(ui: &mut egui::Ui, color_type: &mut ColorType, groups: &m
                 ColorType::Rainbow { .. } => "Rainbow",
                 ColorType::GradientCycle { .. } => "Gradient Cycle",
                 ColorType::Dynamic { .. } => "Dynamic",
+                ColorType::Link { .. } => "Link to…",
             })
             .show_ui(ui, |ui| {
                 if ui.selectable_value(&mut selected_idx, 0, "Solid").clicked() {
@@ -407,12 +413,17 @@ pub fn edit_color_type(ui: &mut egui::Ui, color_type: &mut ColorType, groups: &m
                 }
                 if ui.selectable_value(&mut selected_idx, 4, "Dynamic").clicked() {
                     *color_type = ColorType::Dynamic {
+                        effects: DynamicEffects::default(),
                         group: 0,
                         _legacy_mode: None,
                         _legacy_modes: None,
                         _legacy_tint: None,
                         _legacy_strength: None,
                     };
+                    changed = true;
+                }
+                if ui.selectable_value(&mut selected_idx, 5, "Link to…").clicked() {
+                    *color_type = ColorType::Link { target: LinkTarget::default() };
                     changed = true;
                 }
             });
@@ -486,14 +497,16 @@ pub fn edit_color_type(ui: &mut egui::Ui, color_type: &mut ColorType, groups: &m
                 changed = true;
             }
         }
-        ColorType::Dynamic { group, .. } => {
+        ColorType::Dynamic { effects, .. } => {
             ui.separator();
             ui.label("Dynamic Effects");
-            ui.small("Effects applied in fixed order where this piece is drawn.");
-            changed |= edit_group_picker(ui, group, groups);
+            ui.small("Effects applied in fixed order where this piece is drawn. Each dynamic piece has its own effects unless it is linked to another.");
             ui.separator();
-            let idx = (*group as usize).min(groups.len() - 1);
-            changed |= edit_dynamic_effects(ui, &mut groups[idx]);
+            changed |= edit_dynamic_effects(ui, effects);
+        }
+        ColorType::Link { target } => {
+            ui.separator();
+            changed |= edit_link_target(ui, target, choices);
         }
         _ => {}
     }
@@ -538,35 +551,104 @@ fn edit_interpolation_mode(ui: &mut egui::Ui, interpolation: &mut crate::types::
 
 // ── Dynamic Effects Panel ───────────────────────────────────────
 
-/// Pick which effect group this piece uses, or create a new one.  Pieces that
-/// share a group share its effects; each group is exported on its own.
-fn edit_group_picker(ui: &mut egui::Ui, group: &mut u32, groups: &mut Vec<DynamicEffects>) -> bool {
+/// One entry of the link picker: a piece this one could follow.
+#[derive(Clone)]
+pub struct LinkChoice {
+    pub label: String,
+    /// Swatch color shown next to the label (None for non-solid pieces).
+    pub swatch: Option<egui::Color32>,
+    pub target: LinkTarget,
+    /// "This crosshair" or the other crosshair's name.
+    pub source: String,
+}
+
+fn hex_to_color32(hex: &str) -> egui::Color32 {
+    let (r, g, b, a) = crate::types::parse_hex_color_rgba(hex);
+    egui::Color32::from_rgba_unmultiplied(r, g, b, a)
+}
+
+/// Everything a piece can link to: the other pieces of this crosshair first,
+/// then every other saved crosshair's pieces.
+pub fn link_choices(
+    pieces: &[Piece],
+    own_index: usize,
+    lib: &crate::links::LinkLibrary,
+    current_stem: Option<&str>,
+) -> Vec<LinkChoice> {
+    let mut out = Vec::new();
+    let own_uid = pieces.get(own_index).map_or(0, |p| p.uid());
+    for (i, p) in pieces.iter().enumerate() {
+        if i == own_index || p.uid() == own_uid {
+            continue;
+        }
+        out.push(LinkChoice {
+            label: crate::links::piece_label(i, p),
+            swatch: matches!(p.color_type(), ColorType::Solid).then(|| hex_to_color32(&p.base_color())),
+            target: LinkTarget { crosshair: None, piece: p.uid() },
+            source: "This crosshair".to_string(),
+        });
+    }
+    for (stem, other) in lib.crosshairs() {
+        if Some(stem.as_str()) == current_stem {
+            continue;
+        }
+        for (i, p) in other.iter().enumerate() {
+            out.push(LinkChoice {
+                label: crate::links::piece_label(i, p),
+                swatch: matches!(p.color_type(), ColorType::Solid).then(|| hex_to_color32(&p.base_color())),
+                target: LinkTarget { crosshair: Some(stem.clone()), piece: p.uid() },
+                source: stem.clone(),
+            });
+        }
+    }
+    out
+}
+
+/// The "Link to…" picker.  "(none)" is the empty link.
+fn edit_link_target(ui: &mut egui::Ui, target: &mut LinkTarget, choices: &[LinkChoice]) -> bool {
     let mut changed = false;
-    if groups.is_empty() {
-        groups.push(DynamicEffects::default());
-    }
-    if *group as usize >= groups.len() {
-        *group = groups.len() as u32 - 1;
-        changed = true;
-    }
-    ui.horizontal(|ui| {
-        ui.label("Effect group");
-        egui::ComboBox::from_id_salt("dynamic_group")
-            .selected_text(format!("Group {}", *group + 1))
-            .show_ui(ui, |ui| {
-                for i in 0..groups.len() as u32 {
-                    if ui.selectable_value(group, i, format!("Group {}", i + 1)).clicked() {
+    let current = choices.iter().find(|c| c.target == *target);
+    let none = target.piece == 0;
+    let selected = if none {
+        "(none)".to_string()
+    } else if let Some(c) = current {
+        if c.target.crosshair.is_some() { format!("{} · {}", c.source, c.label) } else { c.label.clone() }
+    } else {
+        "(missing piece)".to_string()
+    };
+
+    ui.label("Follows the color of:");
+    egui::ComboBox::from_id_salt("link_target")
+        .width(ui.available_width() - 8.0)
+        .selected_text(selected)
+        .show_ui(ui, |ui| {
+            if ui.selectable_label(none, "(none)").clicked() {
+                *target = LinkTarget::default();
+                changed = true;
+            }
+            let mut last_source: Option<&str> = None;
+            for c in choices {
+                if last_source != Some(c.source.as_str()) {
+                    ui.separator();
+                    ui.small(&c.source);
+                    last_source = Some(c.source.as_str());
+                }
+                ui.horizontal(|ui| {
+                    if let Some(col) = c.swatch {
+                        ui.label(egui::RichText::new("■").color(col));
+                    }
+                    if ui.selectable_label(c.target == *target, &c.label).clicked() {
+                        *target = c.target.clone();
                         changed = true;
                     }
-                }
-                if groups.len() < MAX_DYNAMIC_GROUPS && ui.selectable_label(false, "+ New group").clicked() {
-                    groups.push(DynamicEffects::default());
-                    *group = groups.len() as u32 - 1;
-                    changed = true;
-                }
-            });
-    });
-    ui.small("Pieces in the same group share effects.");
+                });
+            }
+        });
+    if none {
+        ui.small("Pick a piece to follow its color. Linked dynamic pieces share one effect group.");
+    } else if current.is_none() {
+        ui.small("The linked piece no longer exists; this piece draws white.");
+    }
     changed
 }
 

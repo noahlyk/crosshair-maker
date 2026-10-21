@@ -46,9 +46,6 @@ fn default_sample_size() -> u32 { 1 }
 
 pub const MAX_SAMPLE_SIZE: u32 = 15;
 
-/// Most effect groups a project can have (krosshair loads up to 32).
-pub const MAX_DYNAMIC_GROUPS: usize = 32;
-
 /// How the pixels of the sample area are combined into one color.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PoolMode {
@@ -449,9 +446,11 @@ pub enum ColorType {
     /// accepted by serde but ignored — effects are project-level now.
     #[serde(alias = "ContrastInvert")]
     Dynamic {
-        /// Which effect group (index into `CrosshairProject::dynamic_groups`)
-        /// processes the pixels under this piece.  Each group is exported as
-        /// its own mask + effect block, so pieces can have different effects.
+        /// This piece's own effect chain.  Every Dynamic piece is its own
+        /// effect group unless it is linked to another one (`Link`).
+        #[serde(default)]
+        effects: DynamicEffects,
+        /// Legacy project-level group number (only read to migrate old files).
         #[serde(default)]
         group: u32,
         // Legacy fields — accepted for backward compat, ignored at runtime.
@@ -464,6 +463,23 @@ pub enum ColorType {
         #[serde(default)]
         _legacy_strength: Option<f64>,
     },
+    /// Follow another piece's color: whatever that piece is (solid, animated,
+    /// eraser, dynamic with its effects) this piece is too, and linked
+    /// dynamic pieces share one effect group.
+    Link {
+        target: LinkTarget,
+    },
+}
+
+/// Which piece a `Link` follows.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkTarget {
+    /// Project file stem of another crosshair; `None` = this crosshair.
+    #[serde(default)]
+    pub crosshair: Option<String>,
+    /// `Piece::uid` of the target piece.
+    #[serde(default)]
+    pub piece: u64,
 }
 
 impl Default for ColorType {
@@ -542,6 +558,10 @@ impl std::fmt::Display for OddAnchor {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Piece {
     Cross {
+        /// Stable identity so other pieces (even in other crosshairs) can link to
+        /// this one's color.  0 = not assigned yet (see `assign_uids`).
+        #[serde(default)]
+        uid: u64,
         origin: (i32, i32),
         #[serde(default)]
         left_gap: i32,
@@ -584,6 +604,10 @@ pub enum Piece {
         hard_edges: bool,
     },
     Dot {
+        /// Stable identity so other pieces (even in other crosshairs) can link to
+        /// this one's color.  0 = not assigned yet (see `assign_uids`).
+        #[serde(default)]
+        uid: u64,
         origin: (i32, i32),
         size: u32,
         color: String,
@@ -594,6 +618,10 @@ pub enum Piece {
         odd_anchor: OddAnchor,
     },
     Line {
+        /// Stable identity so other pieces (even in other crosshairs) can link to
+        /// this one's color.  0 = not assigned yet (see `assign_uids`).
+        #[serde(default)]
+        uid: u64,
         origin: (i32, i32),
         vector: (i32, i32),
         thickness: i32,
@@ -607,6 +635,10 @@ pub enum Piece {
         anti_aliasing: bool,
     },
     Rectangle {
+        /// Stable identity so other pieces (even in other crosshairs) can link to
+        /// this one's color.  0 = not assigned yet (see `assign_uids`).
+        #[serde(default)]
+        uid: u64,
         origin: (i32, i32),
         width: u32,
         height: u32,
@@ -636,6 +668,10 @@ pub enum Piece {
         visible: bool,
     },
     HappyFace {
+        /// Stable identity so other pieces (even in other crosshairs) can link to
+        /// this one's color.  0 = not assigned yet (see `assign_uids`).
+        #[serde(default)]
+        uid: u64,
         origin: (i32, i32),
         size: u32,
         color: String,
@@ -703,6 +739,41 @@ impl Piece {
         }
     }
 
+    /// Stable id of this piece (a pattern shares its inner piece's id).
+    pub fn uid(&self) -> u64 {
+        match self {
+            Piece::Cross { uid, .. }
+            | Piece::Dot { uid, .. }
+            | Piece::Line { uid, .. }
+            | Piece::Rectangle { uid, .. }
+            | Piece::HappyFace { uid, .. } => *uid,
+            Piece::RectPattern { obj, .. } | Piece::CircPattern { obj, .. } => obj.uid(),
+        }
+    }
+
+    pub fn set_uid(&mut self, id: u64) {
+        match self {
+            Piece::Cross { uid, .. }
+            | Piece::Dot { uid, .. }
+            | Piece::Line { uid, .. }
+            | Piece::Rectangle { uid, .. }
+            | Piece::HappyFace { uid, .. } => *uid = id,
+            Piece::RectPattern { obj, .. } | Piece::CircPattern { obj, .. } => obj.set_uid(id),
+        }
+    }
+
+    /// Mutable access to the piece's color type (a pattern's lives on its inner piece).
+    pub fn color_type_mut(&mut self) -> &mut ColorType {
+        match self {
+            Piece::Cross { color_type, .. }
+            | Piece::Dot { color_type, .. }
+            | Piece::Line { color_type, .. }
+            | Piece::Rectangle { color_type, .. }
+            | Piece::HappyFace { color_type, .. } => color_type,
+            Piece::RectPattern { obj, .. } | Piece::CircPattern { obj, .. } => obj.color_type_mut(),
+        }
+    }
+
     pub fn color_type(&self) -> ColorType {
         match self {
             Piece::Cross { color_type, .. }
@@ -722,6 +793,8 @@ impl Piece {
             // Dynamic pieces render as a semi-transparent checkerboard hint in the editor,
             // but for animated color purposes we just return a placeholder.
             ColorType::Dynamic { .. } => "#ff00ff80".to_string(),
+            // links are resolved before rendering; unresolved ones show white
+            ColorType::Link { .. } => "#ffffffff".to_string(),
             ColorType::Rainbow { saturation, lightness, alpha, speed, reverse } => {
                 let dir = if reverse { -1.0 } else { 1.0 };
                 let hue = (frame * speed * dir * 360.0).rem_euclid(360.0);
@@ -832,7 +905,7 @@ pub fn max_animation_cycle(pieces: &[Piece]) -> f64 {
         .fold(1.0_f64, f64::max)
 }
 
-fn parse_hex_color_rgba(hex: &str) -> (u8, u8, u8, u8) {
+pub fn parse_hex_color_rgba(hex: &str) -> (u8, u8, u8, u8) {
     let hex = hex.trim_start_matches('#');
     let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(0);
     let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(0);
@@ -854,9 +927,9 @@ pub struct CrosshairProject {
     /// Legacy field kept for backwards-compatible deserialization.
     #[serde(default)]
     pub odd_anchor: Option<OddAnchor>,
-    /// Effect chain of every dynamic group, indexed by the pieces'
-    /// `Dynamic { group }`.  Always has at least one entry once loaded.
-    #[serde(default)]
+    /// Legacy (read only): effect chains by group number.  Migrated into each
+    /// Dynamic piece's own `effects` on load.
+    #[serde(default, skip_serializing)]
     pub dynamic_groups: Vec<DynamicEffects>,
     /// Legacy single global chain (read only; becomes group 0 on load).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -890,6 +963,7 @@ pub fn default_pieces() -> Vec<Piece> {
             y_distance: -10,
             y_quantity: 3,
             obj: Box::new(Dot {
+                uid: 0,
                 origin: (0, 0),
                 size: 1,
                 color: "#ff5050ff".to_string(),
@@ -900,6 +974,7 @@ pub fn default_pieces() -> Vec<Piece> {
             visible: true,
         },
         Cross {
+            uid: 0,
             origin: (0, 0),
             left_gap: 2,
             right_gap: 2,
@@ -924,6 +999,7 @@ pub fn default_pieces() -> Vec<Piece> {
             hard_edges: false,
         },
         HappyFace {
+            uid: 0,
             origin: (-50, -10),
             size: 3,
             color: "#00ff7dff".to_string(),
@@ -936,6 +1012,7 @@ pub fn default_pieces() -> Vec<Piece> {
 
 pub fn default_cross_piece() -> Piece {
     Piece::Cross {
+        uid: 0,
         origin: (0, 0),
         left_gap: 2,
         right_gap: 2,

@@ -384,6 +384,7 @@ pub fn render_pieces_panel(
     let dc = crate::types::ColorType::default();
     if ui.button("Cross").clicked() {
         pieces.push(crate::types::Piece::Cross {
+            uid: 0,
             origin: (0, 0),
             left_gap: 2, right_gap: 2, top_gap: 2, bottom_gap: 2,
             left_thickness: 2, right_thickness: 2, top_thickness: 2, bottom_thickness: 2,
@@ -403,6 +404,7 @@ pub fn render_pieces_panel(
     }
     if ui.button("Dot").clicked() {
         pieces.push(crate::types::Piece::Dot {
+            uid: 0,
             origin: (0, 0),
             size: 2,
             color: "#ff5050ff".to_string(),
@@ -415,6 +417,7 @@ pub fn render_pieces_panel(
     }
     if ui.button("Line").clicked() {
         pieces.push(crate::types::Piece::Line {
+            uid: 0,
             origin: (0, 0),
             vector: (10, 0),
             thickness: 2,
@@ -429,6 +432,7 @@ pub fn render_pieces_panel(
     }
     if ui.button("Rectangle").clicked() {
         pieces.push(crate::types::Piece::Rectangle {
+            uid: 0,
             origin: (0, 0),
             width: 10,
             height: 10,
@@ -443,6 +447,7 @@ pub fn render_pieces_panel(
     }
     if ui.button("HappyFace").clicked() {
         pieces.push(crate::types::Piece::HappyFace {
+            uid: 0,
             origin: (0, 0),
             size: 3,
             color: "#00ff7dff".to_string(),
@@ -461,6 +466,7 @@ pub fn render_pieces_panel(
             y_distance: 10,
             y_quantity: 3,
             obj: Box::new(crate::types::Piece::Dot {
+                uid: 0,
                 origin: (0, 0),
                 size: 2,
                 color: "#ff5050ff".to_string(),
@@ -480,6 +486,7 @@ pub fn render_pieces_panel(
             quantity: 8,
             start_deg: 0.0,
             obj: Box::new(crate::types::Piece::Dot {
+                uid: 0,
                 origin: (0, 0),
                 size: 2,
                 color: "#5050ffff".to_string(),
