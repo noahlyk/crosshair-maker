@@ -32,11 +32,14 @@ pub struct PreviewState {
     /// Selected background for live preview.
     pub selected_bg: PreviewBackground,
     /// Decoded background image (cached).
-    bg_image: Option<(PreviewBackground, image::RgbaImage)>,
+    bg_image: Option<(PreviewBackground, std::rc::Rc<image::RgbaImage>)>,
     /// Composite texture (background + crosshair + effects).
     composite_texture: Option<egui::TextureHandle>,
     /// Hash of everything the composite depends on; unchanged = reuse the texture.
     composite_key: u64,
+    /// Whole-background pooled images by (background, size, mode), so each
+    /// effect pixel is one lookup instead of an NxN sample loop.
+    pooled_cache: std::collections::HashMap<(String, i32, u8), std::rc::Rc<Vec<f32>>>,
     /// Rasterized crosshair + dynamic masks for the current pieces and scale.
     raster_cache: Option<std::rc::Rc<RasterCache>>,
     /// Zoom level (1.0 = default).
@@ -57,6 +60,82 @@ struct RasterCache {
     key: u64,
     crosshair_rgba: Option<Vec<u8>>,
     masks: Vec<(crate::types::DynamicEffects, Vec<u8>)>,
+}
+
+/// Pool every pixel of `bg` over its NxN neighbourhood (edges clamped, like the
+/// per-pixel sampler) into packed 0..1 RGB floats.  A box filter is separable,
+/// so this is two 1-D passes — O(N) per pixel instead of O(N²) — and rows are
+/// split across threads.
+fn pool_background(bg: &image::RgbaImage, n: i32, mode: crate::types::PoolMode) -> Vec<f32> {
+    use crate::types::PoolMode;
+    let (w, h) = (bg.width() as usize, bg.height() as usize);
+    let r = (n / 2).max(0) as isize;
+    let src: Vec<f32> = bg
+        .as_raw()
+        .chunks_exact(4)
+        .flat_map(|p| [p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0])
+        .collect();
+
+    let combine = move |acc: f32, v: f32| match mode {
+        PoolMode::Average => acc + v,
+        PoolMode::Max => acc.max(v),
+        PoolMode::Min => acc.min(v),
+    };
+    let init = match mode {
+        PoolMode::Average | PoolMode::Max => 0.0f32,
+        PoolMode::Min => 1.0f32,
+    };
+    let norm = if mode == PoolMode::Average { 1.0 / n as f32 } else { 1.0 };
+
+    let threads = std::thread::available_parallelism().map_or(4, |t| t.get()).min(16);
+
+    // horizontal pass: rows are independent
+    let mut tmp = vec![0.0f32; src.len()];
+    let rows_per = h.div_ceil(threads).max(1);
+    std::thread::scope(|sc| {
+        for (ci, chunk) in tmp.chunks_mut(rows_per * w * 3).enumerate() {
+            let src = &src;
+            sc.spawn(move || {
+                for (ry, row) in chunk.chunks_mut(w * 3).enumerate() {
+                    let y = ci * rows_per + ry;
+                    for x in 0..w {
+                        for c in 0..3 {
+                            let mut acc = init;
+                            for dx in -r..=r {
+                                let xx = (x as isize + dx).clamp(0, w as isize - 1) as usize;
+                                acc = combine(acc, src[(y * w + xx) * 3 + c]);
+                            }
+                            row[x * 3 + c] = acc * norm;
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    // vertical pass: each output row reads neighbouring rows of `tmp`
+    let mut out = vec![0.0f32; src.len()];
+    std::thread::scope(|sc| {
+        for (ci, chunk) in out.chunks_mut(rows_per * w * 3).enumerate() {
+            let tmp = &tmp;
+            sc.spawn(move || {
+                for (ry, row) in chunk.chunks_mut(w * 3).enumerate() {
+                    let y = (ci * rows_per + ry) as isize;
+                    for x in 0..w {
+                        for c in 0..3 {
+                            let mut acc = init;
+                            for dy in -r..=r {
+                                let yy = (y + dy).clamp(0, h as isize - 1) as usize;
+                                acc = combine(acc, tmp[(yy * w + x) * 3 + c]);
+                            }
+                            row[x * 3 + c] = acc * norm;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    out
 }
 
 fn hash_of(parts: &[&dyn std::fmt::Debug]) -> u64 {
@@ -81,6 +160,7 @@ impl PreviewState {
             bg_image: None,
             composite_texture: None,
             composite_key: 0,
+            pooled_cache: std::collections::HashMap::new(),
             raster_cache: None,
             zoom_level: 1.0,
             crosshair_scale: (1, 1),
@@ -258,7 +338,7 @@ impl PreviewState {
     }
 
     /// Get or load the selected background image.
-    fn ensure_bg_image(&mut self) -> Option<&image::RgbaImage> {
+    fn ensure_bg_image(&mut self) -> Option<std::rc::Rc<image::RgbaImage>> {
         if self.selected_bg == PreviewBackground::None {
             self.bg_image = None;
             return None;
@@ -266,15 +346,15 @@ impl PreviewState {
         // Check if cached bg matches selection
         if let Some((ref cached_bg, _)) = self.bg_image {
             if *cached_bg == self.selected_bg {
-                return self.bg_image.as_ref().map(|(_, img)| img);
+                return self.bg_image.as_ref().map(|(_, img)| img.clone());
             }
         }
         // Load the background from embedded data
         let name = self.selected_bg.label();
         if let Some(data) = crate::bg_embedded::get_background(&name) {
             if let Ok(img) = image::load_from_memory(data) {
-                self.bg_image = Some((self.selected_bg.clone(), img.to_rgba8()));
-                return self.bg_image.as_ref().map(|(_, img)| img);
+                self.bg_image = Some((self.selected_bg.clone(), std::rc::Rc::new(img.to_rgba8())));
+                return self.bg_image.as_ref().map(|(_, img)| img.clone());
             }
         }
         self.bg_image = None;
@@ -960,7 +1040,7 @@ pub fn render_preview_panel(
         }
 
         // Get background image dimensions
-        let bg_img = preview.ensure_bg_image().cloned();
+        let bg_img = preview.ensure_bg_image();
         if let Some(bg) = bg_img {
             let bg_w = bg.width();
             let bg_h = bg.height();
@@ -1068,6 +1148,41 @@ pub fn render_preview_panel(
                 // crosshair pixel, so many composite pixels share one result.
                 let mut native_cache: std::collections::HashMap<(i32, i32, usize), (f32, f32, f32)> =
                     std::collections::HashMap::new();
+                // Pooled copy of the background for each group that pools (cached
+                // across frames; rebuilt only when size/mode/background change).
+                let bg_label = preview.selected_bg.label();
+                if preview.pooled_cache.len() > 6 {
+                    preview.pooled_cache.clear();
+                }
+                let pooled: Vec<Option<std::rc::Rc<Vec<f32>>>> = masks_vec
+                    .iter()
+                    .map(|(effects, _)| {
+                        let n = effects.sample_size_odd() as i32;
+                        if n <= 1 {
+                            return None;
+                        }
+                        let key = (bg_label.clone(), n, effects.pooling as u8);
+                        Some(
+                            preview
+                                .pooled_cache
+                                .entry(key)
+                                .or_insert_with(|| std::rc::Rc::new(pool_background(&bg, n, effects.pooling)))
+                                .clone(),
+                        )
+                    })
+                    .collect();
+                let sample_bg = |gi: usize, x: i32, y: i32| -> (f32, f32, f32) {
+                    match &pooled[gi] {
+                        Some(t) => {
+                            let i = (y as usize * bg_w as usize + x as usize) * 3;
+                            (t[i], t[i + 1], t[i + 2])
+                        }
+                        None => {
+                            let p = bg.get_pixel(x as u32, y as u32);
+                            (p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0)
+                        }
+                    }
+                };
                 let mut pixels = vec![0u8; (composite_w * composite_h * 4) as usize];
                 for y in 0..composite_h {
                     for x in 0..composite_w {
@@ -1114,10 +1229,7 @@ pub fn render_preview_panel(
                                         let sbx = ((snapped_cx - bg_ox as f32) / zoom) as i32;
                                         let sby = ((snapped_cy - bg_oy as f32) / zoom) as i32;
                                         let v = if sbx >= 0 && sby >= 0 && sbx < bg_w as i32 && sby < bg_h as i32 {
-                                            let (r, g, b) = effects.pool(sbx, sby, |x, y| {
-                                                let spx = bg.get_pixel(x.clamp(0, bg_w as i32 - 1) as u32, y.clamp(0, bg_h as i32 - 1) as u32);
-                                                (spx[0] as f32 / 255.0, spx[1] as f32 / 255.0, spx[2] as f32 / 255.0)
-                                            });
+                                            let (r, g, b) = sample_bg(gi, sbx, sby);
                                             effects.apply_to_pixel(r, g, b)
                                         } else {
                                             effects.apply_to_pixel(
@@ -1130,10 +1242,7 @@ pub fn render_preview_panel(
                                         v
                                         }
                                     } else if bx >= 0 && by >= 0 && bx < bg_w as i32 && by < bg_h as i32 {
-                                        let (r, g, b) = effects.pool(bx, by, |x, y| {
-                                            let spx = bg.get_pixel(x.clamp(0, bg_w as i32 - 1) as u32, y.clamp(0, bg_h as i32 - 1) as u32);
-                                            (spx[0] as f32 / 255.0, spx[1] as f32 / 255.0, spx[2] as f32 / 255.0)
-                                        });
+                                        let (r, g, b) = sample_bg(gi, bx, by);
                                         effects.apply_to_pixel(r, g, b)
                                     } else {
                                         effects.apply_to_pixel(
@@ -1490,5 +1599,37 @@ mod layering_tests {
         assert!(!dir.join("t.dynamic.png").exists());
         assert!(!dir.join("t.dynamic.cfg").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pooled_background_matches_per_pixel_sampling() {
+        use crate::types::{DynamicEffects, PoolMode};
+        let (w, h) = (23u32, 17u32);
+        let mut bg = image::RgbaImage::new(w, h);
+        let mut seed = 12345u32;
+        for p in bg.pixels_mut() {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            *p = image::Rgba([(seed >> 8) as u8, (seed >> 16) as u8, (seed >> 24) as u8, 255]);
+        }
+        for mode in PoolMode::ALL {
+            for n in [3u32, 5, 15] {
+                let mut e = DynamicEffects::default();
+                e.sample_size = n;
+                e.pooling = mode;
+                let fast = pool_background(&bg, n as i32, mode);
+                for y in 0..h as i32 {
+                    for x in 0..w as i32 {
+                        let slow = e.pool(x, y, |sx, sy| {
+                            let p = bg.get_pixel(sx.clamp(0, w as i32 - 1) as u32, sy.clamp(0, h as i32 - 1) as u32);
+                            (p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0)
+                        });
+                        let i = (y as usize * w as usize + x as usize) * 3;
+                        assert!((fast[i] - slow.0).abs() < 1e-4, "{mode:?} n={n} at {x},{y}");
+                        assert!((fast[i + 1] - slow.1).abs() < 1e-4);
+                        assert!((fast[i + 2] - slow.2).abs() < 1e-4);
+                    }
+                }
+            }
+        }
     }
 }

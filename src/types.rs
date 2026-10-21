@@ -149,6 +149,7 @@ impl DynamicEffects {
     /// Pool the `sample_size` x `sample_size` area centered on `(x, y)` into one
     /// color.  `get` returns the RGB (0..1) at a coordinate; coordinates are
     /// clamped by the caller.
+    #[cfg(test)]
     pub fn pool(&self, x: i32, y: i32, get: impl Fn(i32, i32) -> (f32, f32, f32)) -> (f32, f32, f32) {
         let n = self.sample_size_odd() as i32;
         if n <= 1 {
