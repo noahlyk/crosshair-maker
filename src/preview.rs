@@ -555,12 +555,18 @@ fn save_dynamic_export(
     if let Some(rgba_data) = rasterize_svg(&svg, w, h) {
         // Convert RGBA to grayscale (take alpha channel as the mask value)
         let gray: Vec<u8> = rgba_data.chunks(4).map(|px| px[3]).collect();
-        let _ = image::save_buffer(&mask_path, &gray, w, h, image::ColorType::L8);
+        let tmp = json_path.with_file_name(format!("{stem}.dynamic.tmp.png"));
+        if image::save_buffer(&tmp, &gray, w, h, image::ColorType::L8).is_ok() {
+            let _ = std::fs::rename(&tmp, &mask_path);
+        }
     }
 
     // Write config file
     let cfg = effects.to_cfg_string();
-    let _ = std::fs::write(&cfg_path, &cfg);
+    let cfg_tmp = json_path.with_file_name(format!("{stem}.dynamic.cfg.tmp"));
+    if std::fs::write(&cfg_tmp, &cfg).is_ok() {
+        let _ = std::fs::rename(&cfg_tmp, &cfg_path);
+    }
 
     // Clean up legacy per-mode mask files
     for tag in crate::types::ALL_LEGACY_MODE_TAGS {
@@ -637,18 +643,18 @@ fn save_static_export(json_path: &std::path::Path, pieces: &[Piece], extent_x: i
                     resvg::tiny_skia::Transform::default(),
                     &mut pixmap.as_mut(),
                 );
-                let _ = image::save_buffer(
-                    json_path.with_extension("png"),
-                    pixmap.data(),
-                    w,
-                    h,
-                    image::ColorType::Rgba8,
-                );
+                // Write to a temp file then rename so krosshair never reads a partial PNG.
+                let tmp = json_path.with_extension("tmp.png");
+                if image::save_buffer(&tmp, pixmap.data(), w, h, image::ColorType::Rgba8).is_ok() {
+                    let _ = std::fs::rename(&tmp, json_path.with_extension("png"));
+                }
             }
         }
     }
-    // Delete the apng if it exists (mutually exclusive)
+    // Delete the apng (and legacy gif) if present: krosshair prefers
+    // apng > gif > png, so a stale one would shadow this fresh png.
     let _ = std::fs::remove_file(json_path.with_extension("apng"));
+    let _ = std::fs::remove_file(json_path.with_extension("gif"));
 }
 
 /// Target FPS for APNG export. Frame values use real-time seconds
@@ -699,7 +705,8 @@ fn save_animated_export(json_path: &std::path::Path, pieces: &[Piece], extent_x:
     // Save as APNG
     if !frames.is_empty() {
         let actual_frames = frames.len() as u32;
-        let apng_path = json_path.with_extension("apng");
+        // Write to a temp file, renamed into place below.
+        let apng_path = json_path.with_extension("tmp.apng");
         if let Ok(file) = File::create(&apng_path) {
             let mut buf_writer = BufWriter::new(file);
             let mut encoder = png::Encoder::new(&mut buf_writer, w, h);
@@ -716,8 +723,12 @@ fn save_animated_export(json_path: &std::path::Path, pieces: &[Piece], extent_x:
         }
     }
 
-    // Delete the png if it exists (mutually exclusive)
+    let _ = std::fs::rename(json_path.with_extension("tmp.apng"), json_path.with_extension("apng"));
+
+    // Delete the png (and legacy gif) if present: they are mutually exclusive
+    // with the apng and a stale gif would shadow it.
     let _ = std::fs::remove_file(json_path.with_extension("png"));
+    let _ = std::fs::remove_file(json_path.with_extension("gif"));
 }
 
 // ── preview panel ───────────────────────────────────────────────────
