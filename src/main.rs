@@ -17,7 +17,7 @@ use preview::PreviewState;
 
 struct CrosshairApp {
     pieces: Vec<Piece>,
-    dynamic_effects: DynamicEffects,
+    dynamic_groups: Vec<DynamicEffects>,
     selected_indices: Vec<usize>,
     status_message: String,
     project_name: String,
@@ -70,7 +70,7 @@ impl CrosshairApp {
         let config = project_io::load_config();
         Self {
             pieces: types::default_pieces(),
-            dynamic_effects: DynamicEffects::default(),
+            dynamic_groups: vec![DynamicEffects::default()],
             selected_indices: Vec::new(),
             status_message: String::new(),
             project_name: "Untitled".to_string(),
@@ -84,19 +84,19 @@ impl CrosshairApp {
             piece_thumbnails: preview::PieceThumbnailCache::new(),
             recent_thumbnails: preview::RecentThumbnailCache::new(),
             has_unsaved_changes: false,
-            last_saved_snapshot: Self::take_snapshot(&types::default_pieces(), &DynamicEffects::default()),
+            last_saved_snapshot: Self::take_snapshot(&types::default_pieces(), &[DynamicEffects::default()]),
             pending_unsaved_action: None,
             show_remove_recent_confirm: None,
             load_error: None,
         }
     }
 
-    fn take_snapshot(pieces: &[types::Piece], dynamic_effects: &DynamicEffects) -> String {
-        serde_json::to_string(&(pieces, dynamic_effects)).unwrap_or_default()
+    fn take_snapshot(pieces: &[types::Piece], dynamic_groups: &[DynamicEffects]) -> String {
+        serde_json::to_string(&(pieces, dynamic_groups)).unwrap_or_default()
     }
 
     fn take_snapshot_current(&self) -> String {
-        Self::take_snapshot(&self.pieces, &self.dynamic_effects)
+        Self::take_snapshot(&self.pieces, &self.dynamic_groups)
     }
 
     fn mark_saved(&mut self) {
@@ -127,18 +127,18 @@ impl CrosshairApp {
     }
 
     fn save_with_exports(&self, path: &std::path::Path) {
-        preview::save_exports(path, &self.pieces, &self.dynamic_effects);
+        preview::save_exports(path, &self.pieces, &self.dynamic_groups);
         self.update_current_if_matches(path);
     }
 
     fn update_current_if_matches(&self, path: &std::path::Path) {
         if self.config.current_crosshair.as_ref().map(|p| p.as_path()) == Some(path) {
-            project_io::save_current_exports(&self.pieces, &self.dynamic_effects);
+            project_io::save_current_exports(&self.pieces, &self.dynamic_groups);
         }
     }
 
     fn set_as_current(&mut self, path: PathBuf) {
-        project_io::save_current_exports(&self.pieces, &self.dynamic_effects);
+        project_io::save_current_exports(&self.pieces, &self.dynamic_groups);
         self.config.current_crosshair = Some(path);
         project_io::save_config(&self.config);
     }
@@ -337,7 +337,8 @@ impl CrosshairApp {
                 name: self.project_name.clone(),
                 pieces: self.pieces.clone(),
                 odd_anchor: None,
-                dynamic_effects: self.dynamic_effects.clone(),
+                dynamic_groups: self.dynamic_groups.clone(),
+                dynamic_effects: None,
             };
             if project_io::save_project(&project, &mut self.config, Some(path.clone())).is_some() {
                 self.save_with_exports(path);
@@ -364,7 +365,8 @@ impl CrosshairApp {
             name: name.to_string(),
             pieces: self.pieces.clone(),
             odd_anchor: None,
-            dynamic_effects: self.dynamic_effects.clone(),
+            dynamic_groups: self.dynamic_groups.clone(),
+            dynamic_effects: None,
         };
         self.project_name = name.to_string();
         if let Some(path) = project_io::save_project(&project, &mut self.config, None) {
@@ -381,7 +383,7 @@ impl CrosshairApp {
 
     fn new_project(&mut self, name: &str) {
         self.pieces = types::default_pieces();
-        self.dynamic_effects = DynamicEffects::default();
+        self.dynamic_groups = vec![DynamicEffects::default()];
         self.project_name = name.to_string();
         self.current_file_path = None;
         self.selected_indices.clear();
@@ -397,7 +399,11 @@ impl CrosshairApp {
             Ok(project) => {
                 let name = project.name.clone();
                 self.pieces = project.pieces;
-                self.dynamic_effects = project.dynamic_effects;
+                self.dynamic_groups = project.dynamic_groups;
+                if self.dynamic_groups.is_empty() {
+                    // files from before groups: the single global chain is group 0
+                    self.dynamic_groups.push(project.dynamic_effects.unwrap_or_default());
+                }
                 self.project_name = name.clone();
                 self.current_file_path = Some(path.clone());
                 self.selected_indices.clear();
@@ -528,7 +534,7 @@ impl eframe::App for CrosshairApp {
                     if self.selected_indices.len() == 1 {
                         let idx = self.selected_indices[0];
                         if let Some(piece) = self.pieces.get_mut(idx) {
-                            if ui_properties::edit_piece(ui, piece, &mut self.dynamic_effects) {
+                            if ui_properties::edit_piece(ui, piece, &mut self.dynamic_groups) {
                                 self.preview.mark_dirty();
                                 self.check_unsaved();
                             }
@@ -548,7 +554,7 @@ impl eframe::App for CrosshairApp {
             ui.heading("Preview");
             ui.separator();
 
-            preview::render_preview_panel(ui, ctx, &mut self.preview, &self.pieces, &self.dynamic_effects);
+            preview::render_preview_panel(ui, ctx, &mut self.preview, &self.pieces, &self.dynamic_groups);
         });
 
         if self.show_new_dialog {

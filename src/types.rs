@@ -46,6 +46,9 @@ fn default_sample_size() -> u32 { 1 }
 
 pub const MAX_SAMPLE_SIZE: u32 = 15;
 
+/// Most effect groups a project can have (krosshair loads up to 32).
+pub const MAX_DYNAMIC_GROUPS: usize = 32;
+
 /// How the pixels of the sample area are combined into one color.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PoolMode {
@@ -446,6 +449,11 @@ pub enum ColorType {
     /// accepted by serde but ignored — effects are project-level now.
     #[serde(alias = "ContrastInvert")]
     Dynamic {
+        /// Which effect group (index into `CrosshairProject::dynamic_groups`)
+        /// processes the pixels under this piece.  Each group is exported as
+        /// its own mask + effect block, so pieces can have different effects.
+        #[serde(default)]
+        group: u32,
         // Legacy fields — accepted for backward compat, ignored at runtime.
         #[serde(default, alias = "mode")]
         _legacy_mode: Option<DynamicModeTag>,
@@ -687,6 +695,14 @@ impl Piece {
         }
     }
 
+    /// The dynamic effect group this piece belongs to, if it is Dynamic.
+    pub fn dynamic_group(&self) -> Option<u32> {
+        match self.color_type() {
+            ColorType::Dynamic { group, .. } => Some(group),
+            _ => None,
+        }
+    }
+
     pub fn color_type(&self) -> ColorType {
         match self {
             Piece::Cross { color_type, .. }
@@ -838,10 +854,13 @@ pub struct CrosshairProject {
     /// Legacy field kept for backwards-compatible deserialization.
     #[serde(default)]
     pub odd_anchor: Option<OddAnchor>,
-    /// Global dynamic effect chain.  When any piece is Dynamic, these
-    /// effects are applied where the mask is white.
+    /// Effect chain of every dynamic group, indexed by the pieces'
+    /// `Dynamic { group }`.  Always has at least one entry once loaded.
     #[serde(default)]
-    pub dynamic_effects: DynamicEffects,
+    pub dynamic_groups: Vec<DynamicEffects>,
+    /// Legacy single global chain (read only; becomes group 0 on load).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_effects: Option<DynamicEffects>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

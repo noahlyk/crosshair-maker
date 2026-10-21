@@ -476,7 +476,7 @@ impl RecentThumbnailCache {
 }
 
 /// Save SVG and PNG/APNG exports alongside a project JSON path.
-pub fn save_exports(json_path: &std::path::Path, pieces: &[Piece], effects: &crate::types::DynamicEffects) {
+pub fn save_exports(json_path: &std::path::Path, pieces: &[Piece], groups: &[crate::types::DynamicEffects]) {
     let (extent_x, extent_y) = infer_extent(pieces);
     if extent_x <= 0 || extent_y <= 0 {
         return;
@@ -497,22 +497,23 @@ pub fn save_exports(json_path: &std::path::Path, pieces: &[Piece], effects: &cra
     }
 
     // Export dynamic mask + config
-    save_dynamic_export(json_path, pieces, effects, extent_x, extent_y);
+    save_dynamic_export(json_path, pieces, groups, extent_x, extent_y);
 }
 
 fn is_dynamic(piece: &Piece) -> bool {
     matches!(piece.color_type(), crate::types::ColorType::Dynamic { .. })
 }
 
-/// Pieces for rendering the dynamic mask: Dynamic pieces are white, every other
-/// piece is opaque black so anything layered above a Dynamic piece cuts it out.
-/// Read the result's red channel (white = apply effects).
-fn dynamic_mask_pieces(pieces: &[Piece]) -> Vec<Piece> {
+/// Pieces for rendering one dynamic group's mask: that group's pieces are
+/// white, every other piece (static, erasers, other groups) is opaque black, so
+/// anything layered above a piece cuts it out of the mask — and layered below
+/// it is erased.  Read the result's red channel (white = apply this group).
+fn dynamic_mask_pieces(pieces: &[Piece], group: u32) -> Vec<Piece> {
     pieces
         .iter()
         .map(|p| {
             let mut mp = p.clone();
-            if is_dynamic(p) {
+            if p.dynamic_group() == Some(group) {
                 mp.set_color_override("#ffffffff");
             } else {
                 mp.set_color_override("#000000ff");
@@ -522,60 +523,94 @@ fn dynamic_mask_pieces(pieces: &[Piece]) -> Vec<Piece> {
         .collect()
 }
 
-/// Save dynamic mask + config file.
+/// Dynamic groups that are in use and have an effect enabled, in group order.
+/// These are the groups that get a mask and a cfg block.
+fn active_groups<'a>(
+    pieces: &[Piece],
+    groups: &'a [crate::types::DynamicEffects],
+) -> Vec<(u32, &'a crate::types::DynamicEffects)> {
+    let mut ids: Vec<u32> = pieces.iter().filter_map(|p| p.dynamic_group()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids.into_iter()
+        .filter_map(|id| groups.get(id as usize).map(|e| (id, e)))
+        .filter(|(_, e)| e.has_any_enabled())
+        .collect()
+}
+
+/// File name of a group's mask: group 0 keeps the original
+/// `{stem}.dynamic.png`, the rest are `{stem}.dynamic.{id}.png`.
+fn dynamic_mask_name(stem: &str, id: u32) -> String {
+    if id == 0 {
+        format!("{stem}.dynamic.png")
+    } else {
+        format!("{stem}.dynamic.{id}.png")
+    }
+}
+
+/// Save the dynamic masks + config.
 ///
-/// Exports:
-/// - `{stem}.dynamic.png` — grayscale binary mask (white where Dynamic pieces are)
-/// - `{stem}.dynamic.cfg` — effect chain configuration (one line per enabled effect)
+/// Exports, for every dynamic group in use that has an effect enabled:
+/// - `{stem}.dynamic.png` / `{stem}.dynamic.{id}.png` — grayscale mask of the
+///   group (white where its pieces are visible after layering)
+/// - `{stem}.dynamic.cfg` — one `group {id}` block of effect lines per group
 ///
-/// Cleans up old per-mode mask files from the previous architecture.
+/// Masks are written before the cfg (which lists the groups), and stale masks
+/// of groups that no longer exist are removed.
 fn save_dynamic_export(
     json_path: &std::path::Path,
     pieces: &[Piece],
-    effects: &crate::types::DynamicEffects,
+    groups: &[crate::types::DynamicEffects],
     extent_x: i32,
     extent_y: i32,
 ) {
-    let stem = json_path.file_stem().unwrap_or_default().to_string_lossy();
-    let mask_path = json_path.with_file_name(format!("{stem}.dynamic.png"));
+    let stem = json_path.file_stem().unwrap_or_default().to_string_lossy().to_string();
     let cfg_path = json_path.with_file_name(format!("{stem}.dynamic.cfg"));
-
-    let has_dyn = pieces.iter().any(|p| is_dynamic(p));
-
-    if !has_dyn || !effects.has_any_enabled() {
-        // Clean up dynamic files
-        let _ = std::fs::remove_file(&mask_path);
-        let _ = std::fs::remove_file(&cfg_path);
-        // Clean up legacy per-mode mask files
-        for tag in crate::types::ALL_LEGACY_MODE_TAGS {
-            let _ = std::fs::remove_file(json_path.with_file_name(format!("{stem}.mask.{tag}.png")));
-        }
-        let _ = std::fs::remove_file(json_path.with_file_name(format!("{stem}.mask.png")));
-        let _ = std::fs::remove_file(json_path.with_file_name(format!("{stem}.mask.apng")));
-        return;
-    }
+    let active = active_groups(pieces, groups);
 
     let w = extent_x as u32 * 2;
     let h = extent_y as u32 * 2;
 
-    // Build binary mask: Dynamic pieces = white, everything else = hidden
-    let mask_pieces = dynamic_mask_pieces(pieces);
-
-    let svg = generate_svg(extent_x.cast_unsigned(), extent_y.cast_unsigned(), &mask_pieces);
-    if let Some(rgba_data) = rasterize_svg(&svg, w, h) {
-        // Convert RGBA to grayscale (take alpha channel as the mask value)
+    let mut kept: Vec<String> = Vec::new();
+    let mut cfg = String::new();
+    for (id, effects) in &active {
+        let mask_pieces = dynamic_mask_pieces(pieces, *id);
+        let svg = generate_svg(extent_x.cast_unsigned(), extent_y.cast_unsigned(), &mask_pieces);
+        let Some(rgba_data) = rasterize_svg(&svg, w, h) else { continue };
+        // the red channel is the mask value
         let gray: Vec<u8> = rgba_data.chunks(4).map(|px| px[0]).collect();
+        let name = dynamic_mask_name(&stem, *id);
         let tmp = json_path.with_file_name(format!("{stem}.dynamic.tmp.png"));
-        if image::save_buffer(&tmp, &gray, w, h, image::ColorType::L8).is_ok() {
-            let _ = std::fs::rename(&tmp, &mask_path);
+        if image::save_buffer(&tmp, &gray, w, h, image::ColorType::L8).is_ok()
+            && std::fs::rename(&tmp, json_path.with_file_name(&name)).is_ok()
+        {
+            cfg.push_str(&format!("group {id}\n"));
+            cfg.push_str(&effects.to_cfg_string());
+            kept.push(name);
         }
     }
 
-    // Write config file
-    let cfg = effects.to_cfg_string();
-    let cfg_tmp = json_path.with_file_name(format!("{stem}.dynamic.cfg.tmp"));
-    if std::fs::write(&cfg_tmp, &cfg).is_ok() {
-        let _ = std::fs::rename(&cfg_tmp, &cfg_path);
+    // Drop masks of groups that are gone (any `{stem}.dynamic*.png`).
+    if let Some(dir) = json_path.parent() {
+        let dir = if dir.as_os_str().is_empty() { std::path::Path::new(".") } else { dir };
+        let prefix = format!("{stem}.dynamic");
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with(&prefix) && name.ends_with(".png") && !kept.contains(&name) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+
+    if kept.is_empty() {
+        let _ = std::fs::remove_file(&cfg_path);
+    } else {
+        let cfg_tmp = json_path.with_file_name(format!("{stem}.dynamic.cfg.tmp"));
+        if std::fs::write(&cfg_tmp, &cfg).is_ok() {
+            let _ = std::fs::rename(&cfg_tmp, &cfg_path);
+        }
     }
 
     // Clean up legacy per-mode mask files
@@ -748,7 +783,7 @@ pub fn render_preview_panel(
     ctx: &egui::Context,
     preview: &mut PreviewState,
     pieces: &[Piece],
-    effects: &crate::types::DynamicEffects,
+    groups: &[crate::types::DynamicEffects],
 ) {
     let (extent_x, extent_y) = infer_extent(pieces);
     let width = extent_x.cast_unsigned() * 2;
@@ -805,7 +840,7 @@ pub fn render_preview_panel(
     });
 
     let has_bg = preview.selected_bg != PreviewBackground::None;
-    let has_dynamic = pieces.iter().any(|p| is_dynamic(p));
+    let active = active_groups(pieces, groups);
 
     // Handle scroll-wheel: Ctrl+Scroll = crosshair scale (only with background),
     // plain Scroll = zoom.
@@ -949,17 +984,18 @@ pub fn render_preview_panel(
                 };
 
                 // Rasterize binary mask (dynamic pieces = white, rest hidden)
-                let mask_rgba = if has_dynamic && effects.has_any_enabled() {
-                    let mask_pieces = dynamic_mask_pieces(pieces);
-                    let svg = if sn != 1 || sd != 1 {
-                        generate_svg_scaled(ext_x, ext_y, &mask_pieces, sn, sd)
-                    } else {
-                        generate_svg(ext_x, ext_y, &mask_pieces)
-                    };
-                    rasterize_svg(&svg, raster_w, raster_h)
-                } else {
-                    None
-                };
+                let masks: Vec<(&crate::types::DynamicEffects, Vec<u8>)> = active
+                    .iter()
+                    .filter_map(|(id, effects)| {
+                        let mask_pieces = dynamic_mask_pieces(pieces, *id);
+                        let svg = if sn != 1 || sd != 1 {
+                            generate_svg_scaled(ext_x, ext_y, &mask_pieces, sn, sd)
+                        } else {
+                            generate_svg(ext_x, ext_y, &mask_pieces)
+                        };
+                        rasterize_svg(&svg, raster_w, raster_h).map(|m| (*effects, m))
+                    })
+                    .collect();
 
                 let actual_ch_w = raster_w;
                 let actual_ch_h = raster_h;
@@ -998,7 +1034,7 @@ pub fn render_preview_panel(
                             // 2. Dynamic effects (where mask is white, transform bg pixel)
                             //    When crosshair is scaled, snap bg sample to native pixel
                             //    grid so the effect honestly represents native resolution.
-                            if let Some(ref mask) = mask_rgba {
+                            for (effects, mask) in &masks {
                                 if ci + 3 < mask.len() {
                                     let mask_alpha = mask[ci] as f32 / 255.0;
                                     if mask_alpha > 0.001 {
@@ -1105,7 +1141,7 @@ pub fn render_preview_panel(
         } // end !is_capped else
     } else {
         // No background — apply dynamic effects with gray background, scale with zoom
-        if has_dynamic && effects.has_any_enabled() {
+        if !active.is_empty() {
             ctx.request_repaint();
 
             let ext_x = extent_x.cast_unsigned().min(preview.max_preview_size());
@@ -1120,11 +1156,14 @@ pub fn render_preview_panel(
                 rasterize_svg(&svg, raster_w, raster_h)
             };
 
-            let mask_rgba = {
-                let mask_pieces = dynamic_mask_pieces(pieces);
-                let svg = generate_svg(ext_x, ext_y, &mask_pieces);
-                rasterize_svg(&svg, raster_w, raster_h)
-            };
+            let masks: Vec<(&crate::types::DynamicEffects, Vec<u8>)> = active
+                .iter()
+                .filter_map(|(id, effects)| {
+                    let mask_pieces = dynamic_mask_pieces(pieces, *id);
+                    let svg = generate_svg(ext_x, ext_y, &mask_pieces);
+                    rasterize_svg(&svg, raster_w, raster_h).map(|m| (*effects, m))
+                })
+                .collect();
 
             if raster_w > 0 && raster_h > 0 {
                 let mut pixels = vec![0u8; (raster_w * raster_h * 4) as usize];
@@ -1134,7 +1173,7 @@ pub fn render_preview_panel(
 
                         let (mut pr, mut pg, mut pb) = (20u8, 20u8, 20u8);
 
-                        if let Some(ref mask) = mask_rgba {
+                        for (effects, mask) in &masks {
                             if pi + 3 < mask.len() {
                                 let mask_alpha = mask[pi] as f32 / 255.0;
                                 if mask_alpha > 0.001 {
@@ -1253,11 +1292,16 @@ mod layering_tests {
     use crate::types::{default_cross_piece, ColorType};
 
     fn cross(color: &str, dynamic: bool) -> Piece {
+        cross_in(color, dynamic.then_some(0))
+    }
+
+    fn cross_in(color: &str, group: Option<u32>) -> Piece {
         let mut p = default_cross_piece();
         p.set_color_override(color);
-        if dynamic {
+        if let Some(group) = group {
             if let Piece::Cross { color_type, .. } = &mut p {
                 *color_type = ColorType::Dynamic {
+                    group,
                     _legacy_mode: None,
                     _legacy_modes: None,
                     _legacy_tint: None,
@@ -1275,8 +1319,8 @@ mod layering_tests {
 
     #[test]
     fn solid_above_dynamic_cuts_the_mask() {
-        let dyn_only = render(&dynamic_mask_pieces(&[cross("#ff0000ff", true)]));
-        let covered = render(&dynamic_mask_pieces(&[cross("#ff0000ff", true), cross("#00ff00ff", false)]));
+        let dyn_only = render(&dynamic_mask_pieces(&[cross("#ff0000ff", true)], 0));
+        let covered = render(&dynamic_mask_pieces(&[cross("#ff0000ff", true), cross("#00ff00ff", false)], 0));
         assert!(dyn_only.chunks(4).any(|p| p[0] == 255));
         assert!(covered.chunks(4).all(|p| p[0] == 0));
     }
@@ -1303,5 +1347,78 @@ mod layering_tests {
         }
         let pieces = [cross("#ff0000ff", false), e.clone(), cross("#00ff00ff", false), e];
         assert!(render(&pieces).chunks(4).all(|p| p[3] == 0));
+    }
+
+    fn lit(mask: &[u8]) -> bool {
+        mask.chunks(4).any(|p| p[0] > 0)
+    }
+
+    #[test]
+    fn groups_get_separate_masks() {
+        let pieces = [cross_in("#ffffffff", Some(0)), cross_in("#ffffffff", Some(1))];
+        // both crosses sit at the same place: group 1 is above group 0
+        let m0 = render(&dynamic_mask_pieces(&pieces, 0));
+        let m1 = render(&dynamic_mask_pieces(&pieces, 1));
+        assert!(!lit(&m0), "group 0 is fully covered by group 1 above it");
+        assert!(lit(&m1));
+    }
+
+    #[test]
+    fn group_below_is_erased_and_group_above_wins() {
+        let a_above = [cross_in("#ffffffff", Some(1)), cross_in("#ffffffff", Some(0))];
+        assert!(lit(&render(&dynamic_mask_pieces(&a_above, 0))));
+        assert!(!lit(&render(&dynamic_mask_pieces(&a_above, 1))));
+    }
+
+    #[test]
+    fn static_above_group_cuts_it_in_every_mask() {
+        let pieces = [cross_in("#ffffffff", Some(0)), cross_in("#ffffffff", Some(1)), cross("#00ff00ff", false)];
+        assert!(!lit(&render(&dynamic_mask_pieces(&pieces, 0))));
+        assert!(!lit(&render(&dynamic_mask_pieces(&pieces, 1))));
+    }
+
+    #[test]
+    fn export_writes_one_mask_and_block_per_group_and_prunes() {
+        use crate::types::DynamicEffects;
+        let dir = std::env::temp_dir().join(format!("cm_groups_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = dir.join("t.json");
+
+        let mut g0 = DynamicEffects::default();
+        g0.invert.enabled = true;
+        let mut g2 = DynamicEffects::default();
+        g2.saturate.enabled = true;
+        let off = DynamicEffects::default();
+        let groups = [g0, off, g2];
+
+        // two crosses side by side would overlap here, so give them different layers
+        let mut a = cross_in("#ffffffff", Some(0));
+        let mut b = cross_in("#ffffffff", Some(2));
+        if let (Piece::Cross { rotation: ra, .. }, Piece::Cross { rotation: rb, .. }) = (&mut a, &mut b) {
+            *ra = 0.0;
+            *rb = 45.0;
+        }
+        let pieces = [a, b];
+        save_dynamic_export(&json, &pieces, &groups, 20, 20);
+
+        assert!(dir.join("t.dynamic.png").exists());
+        assert!(!dir.join("t.dynamic.1.png").exists(), "group 1 has no pieces/effects");
+        assert!(dir.join("t.dynamic.2.png").exists());
+        let cfg = std::fs::read_to_string(dir.join("t.dynamic.cfg")).unwrap();
+        assert!(cfg.contains("group 0\ninvert"));
+        assert!(cfg.contains("group 2\nsaturate"));
+
+        // dropping group 2's piece prunes its mask and block
+        save_dynamic_export(&json, &pieces[..1], &groups, 20, 20);
+        assert!(!dir.join("t.dynamic.2.png").exists());
+        let cfg = std::fs::read_to_string(dir.join("t.dynamic.cfg")).unwrap();
+        assert!(!cfg.contains("group 2"));
+
+        // nothing dynamic left: everything is removed
+        save_dynamic_export(&json, &[cross("#ff0000ff", false)], &groups, 20, 20);
+        assert!(!dir.join("t.dynamic.png").exists());
+        assert!(!dir.join("t.dynamic.cfg").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

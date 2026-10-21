@@ -73,10 +73,10 @@ pub fn project_dir() -> PathBuf {
 
 /// Export "current" crosshair in the projects directory.
 /// Saves as current.png (static) or current.apng (animated), deleting the other.
-pub fn save_current_exports(pieces: &[crate::types::Piece], effects: &crate::types::DynamicEffects) {
+pub fn save_current_exports(pieces: &[crate::types::Piece], groups: &[crate::types::DynamicEffects]) {
     let dir = project_dir();
     let current_path = dir.join("current.json"); // virtual path for extension swapping
-    crate::preview::save_exports(&current_path, pieces, effects);
+    crate::preview::save_exports(&current_path, pieces, groups);
 }
 
 pub fn save_project(project: &CrosshairProject, config: &mut AppConfig, path: Option<PathBuf>) -> Option<PathBuf> {
