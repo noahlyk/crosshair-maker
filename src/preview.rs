@@ -37,9 +37,6 @@ pub struct PreviewState {
     composite_texture: Option<egui::TextureHandle>,
     /// Hash of everything the composite depends on; unchanged = reuse the texture.
     composite_key: u64,
-    /// Whole-background pooled images by (background, size, mode), so each
-    /// effect pixel is one lookup instead of an NxN sample loop.
-    pooled_cache: std::collections::HashMap<(String, i32, u8), std::rc::Rc<Vec<f32>>>,
     /// Rasterized crosshair + dynamic masks for the current pieces and scale.
     raster_cache: Option<std::rc::Rc<RasterCache>>,
     /// Zoom level (1.0 = default).
@@ -62,19 +59,46 @@ struct RasterCache {
     masks: Vec<(crate::types::DynamicEffects, Vec<u8>)>,
 }
 
-/// Pool every pixel of `bg` over its NxN neighbourhood (edges clamped, like the
-/// per-pixel sampler) into packed 0..1 RGB floats.  A box filter is separable,
-/// so this is two 1-D passes — O(N) per pixel instead of O(N²) — and rows are
-/// split across threads.
-fn pool_background(bg: &image::RgbaImage, n: i32, mode: crate::types::PoolMode) -> Vec<f32> {
+/// Pooled colors for a rectangle of the background.
+struct PooledRegion {
+    x0: i32,
+    y0: i32,
+    w: i32,
+    h: i32,
+    /// Packed 0..1 RGB, row-major over the rectangle.
+    data: Vec<f32>,
+}
+
+impl PooledRegion {
+    fn get(&self, x: i32, y: i32) -> Option<(f32, f32, f32)> {
+        if x < self.x0 || y < self.y0 || x >= self.x0 + self.w || y >= self.y0 + self.h {
+            return None;
+        }
+        let i = ((y - self.y0) as usize * self.w as usize + (x - self.x0) as usize) * 3;
+        Some((self.data[i], self.data[i + 1], self.data[i + 2]))
+    }
+}
+
+/// Pool the NxN neighbourhood of every pixel in `[x0,x1) x [y0,y1)` of `bg`
+/// (edges clamped to the image).  Only that rectangle is computed: a box
+/// filter is separable, so it is two 1-D passes — O(N) per pixel instead of
+/// O(N²) — over the rectangle plus an N/2 margin.  Big regions are split
+/// across threads.
+fn pool_region(bg: &image::RgbaImage, x0: i32, y0: i32, x1: i32, y1: i32, n: i32, mode: crate::types::PoolMode) -> PooledRegion {
     use crate::types::PoolMode;
-    let (w, h) = (bg.width() as usize, bg.height() as usize);
-    let r = (n / 2).max(0) as isize;
-    let src: Vec<f32> = bg
-        .as_raw()
-        .chunks_exact(4)
-        .flat_map(|p| [p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0])
-        .collect();
+    let (bw, bh) = (bg.width() as i32, bg.height() as i32);
+    let (x0, y0) = (x0.clamp(0, bw), y0.clamp(0, bh));
+    let (x1, y1) = (x1.clamp(x0, bw), y1.clamp(y0, bh));
+    let (w, h) = ((x1 - x0) as usize, (y1 - y0) as usize);
+    let empty = PooledRegion { x0, y0, w: w as i32, h: h as i32, data: Vec::new() };
+    if w == 0 || h == 0 {
+        return empty;
+    }
+    let r = (n / 2).max(0);
+    let raw = bg.as_raw();
+    let px = |x: i32, y: i32, c: usize| -> f32 {
+        raw[((y.clamp(0, bh - 1) as usize * bw as usize) + x.clamp(0, bw - 1) as usize) * 4 + c] as f32 / 255.0
+    };
 
     let combine = move |acc: f32, v: f32| match mode {
         PoolMode::Average => acc + v,
@@ -87,23 +111,29 @@ fn pool_background(bg: &image::RgbaImage, n: i32, mode: crate::types::PoolMode) 
     };
     let norm = if mode == PoolMode::Average { 1.0 / n as f32 } else { 1.0 };
 
-    let threads = std::thread::available_parallelism().map_or(4, |t| t.get()).min(16);
+    // horizontal pass over the rows the vertical pass will need
+    let ty0 = (y0 - r).max(0);
+    let ty1 = (y1 + r).min(bh);
+    let th = (ty1 - ty0) as usize;
+    let mut tmp = vec![0.0f32; th * w * 3];
 
-    // horizontal pass: rows are independent
-    let mut tmp = vec![0.0f32; src.len()];
-    let rows_per = h.div_ceil(threads).max(1);
+    let threads = if w * th > 40_000 {
+        std::thread::available_parallelism().map_or(4, |t| t.get()).min(16)
+    } else {
+        1
+    };
+    let rows_per = th.div_ceil(threads).max(1);
     std::thread::scope(|sc| {
         for (ci, chunk) in tmp.chunks_mut(rows_per * w * 3).enumerate() {
-            let src = &src;
+            let px = &px;
             sc.spawn(move || {
                 for (ry, row) in chunk.chunks_mut(w * 3).enumerate() {
-                    let y = ci * rows_per + ry;
+                    let y = ty0 + (ci * rows_per + ry) as i32;
                     for x in 0..w {
                         for c in 0..3 {
                             let mut acc = init;
                             for dx in -r..=r {
-                                let xx = (x as isize + dx).clamp(0, w as isize - 1) as usize;
-                                acc = combine(acc, src[(y * w + xx) * 3 + c]);
+                                acc = combine(acc, px(x0 + x as i32 + dx, y, c));
                             }
                             row[x * 3 + c] = acc * norm;
                         }
@@ -113,20 +143,21 @@ fn pool_background(bg: &image::RgbaImage, n: i32, mode: crate::types::PoolMode) 
         }
     });
 
-    // vertical pass: each output row reads neighbouring rows of `tmp`
-    let mut out = vec![0.0f32; src.len()];
+    // vertical pass
+    let mut out = vec![0.0f32; w * h * 3];
+    let rows_per = h.div_ceil(threads).max(1);
     std::thread::scope(|sc| {
         for (ci, chunk) in out.chunks_mut(rows_per * w * 3).enumerate() {
             let tmp = &tmp;
             sc.spawn(move || {
                 for (ry, row) in chunk.chunks_mut(w * 3).enumerate() {
-                    let y = (ci * rows_per + ry) as isize;
+                    let y = y0 + (ci * rows_per + ry) as i32;
                     for x in 0..w {
                         for c in 0..3 {
                             let mut acc = init;
                             for dy in -r..=r {
-                                let yy = (y + dy).clamp(0, h as isize - 1) as usize;
-                                acc = combine(acc, tmp[(yy * w + x) * 3 + c]);
+                                let yy = (y + dy).clamp(0, bh - 1) - ty0;
+                                acc = combine(acc, tmp[(yy as usize * w + x) * 3 + c]);
                             }
                             row[x * 3 + c] = acc * norm;
                         }
@@ -135,7 +166,7 @@ fn pool_background(bg: &image::RgbaImage, n: i32, mode: crate::types::PoolMode) 
             });
         }
     });
-    out
+    PooledRegion { x0, y0, w: w as i32, h: h as i32, data: out }
 }
 
 fn hash_of(parts: &[&dyn std::fmt::Debug]) -> u64 {
@@ -160,7 +191,6 @@ impl PreviewState {
             bg_image: None,
             composite_texture: None,
             composite_key: 0,
-            pooled_cache: std::collections::HashMap::new(),
             raster_cache: None,
             zoom_level: 1.0,
             crosshair_scale: (1, 1),
@@ -1148,40 +1178,26 @@ pub fn render_preview_panel(
                 // crosshair pixel, so many composite pixels share one result.
                 let mut native_cache: std::collections::HashMap<(i32, i32, usize), (f32, f32, f32)> =
                     std::collections::HashMap::new();
-                // Pooled copy of the background for each group that pools (cached
-                // across frames; rebuilt only when size/mode/background change).
-                let bg_label = preview.selected_bg.label();
-                if preview.pooled_cache.len() > 6 {
-                    preview.pooled_cache.clear();
-                }
-                let pooled: Vec<Option<std::rc::Rc<Vec<f32>>>> = masks_vec
+                // Pool only the part of the background under the crosshair, per
+                // group (each group has its own size and mode).
+                let to_bg = |cx: f32, off: i32| (cx - off as f32) / zoom;
+                let rx0 = to_bg(ch_ox as f32, bg_ox).floor() as i32 - 2;
+                let rx1 = to_bg((ch_ox + actual_ch_w as i32) as f32, bg_ox).ceil() as i32 + 2;
+                let ry0 = to_bg(ch_oy as f32, bg_oy).floor() as i32 - 2;
+                let ry1 = to_bg((ch_oy + actual_ch_h as i32) as f32, bg_oy).ceil() as i32 + 2;
+                let pooled: Vec<Option<PooledRegion>> = masks_vec
                     .iter()
                     .map(|(effects, _)| {
                         let n = effects.sample_size_odd() as i32;
-                        if n <= 1 {
-                            return None;
-                        }
-                        let key = (bg_label.clone(), n, effects.pooling as u8);
-                        Some(
-                            preview
-                                .pooled_cache
-                                .entry(key)
-                                .or_insert_with(|| std::rc::Rc::new(pool_background(&bg, n, effects.pooling)))
-                                .clone(),
-                        )
+                        (n > 1).then(|| pool_region(&bg, rx0, ry0, rx1, ry1, n, effects.pooling))
                     })
                     .collect();
                 let sample_bg = |gi: usize, x: i32, y: i32| -> (f32, f32, f32) {
-                    match &pooled[gi] {
-                        Some(t) => {
-                            let i = (y as usize * bg_w as usize + x as usize) * 3;
-                            (t[i], t[i + 1], t[i + 2])
-                        }
-                        None => {
-                            let p = bg.get_pixel(x as u32, y as u32);
-                            (p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0)
-                        }
+                    if let Some(v) = pooled[gi].as_ref().and_then(|t| t.get(x, y)) {
+                        return v;
                     }
+                    let p = bg.get_pixel(x.clamp(0, bg_w as i32 - 1) as u32, y.clamp(0, bg_h as i32 - 1) as u32);
+                    (p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0)
                 };
                 let mut pixels = vec![0u8; (composite_w * composite_h * 4) as usize];
                 for y in 0..composite_h {
@@ -1602,7 +1618,7 @@ mod layering_tests {
     }
 
     #[test]
-    fn pooled_background_matches_per_pixel_sampling() {
+    fn pooled_region_matches_per_pixel_sampling() {
         use crate::types::{DynamicEffects, PoolMode};
         let (w, h) = (23u32, 17u32);
         let mut bg = image::RgbaImage::new(w, h);
@@ -1611,22 +1627,25 @@ mod layering_tests {
             seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
             *p = image::Rgba([(seed >> 8) as u8, (seed >> 16) as u8, (seed >> 24) as u8, 255]);
         }
-        for mode in PoolMode::ALL {
-            for n in [3u32, 5, 15] {
-                let mut e = DynamicEffects::default();
-                e.sample_size = n;
-                e.pooling = mode;
-                let fast = pool_background(&bg, n as i32, mode);
-                for y in 0..h as i32 {
-                    for x in 0..w as i32 {
-                        let slow = e.pool(x, y, |sx, sy| {
-                            let p = bg.get_pixel(sx.clamp(0, w as i32 - 1) as u32, sy.clamp(0, h as i32 - 1) as u32);
-                            (p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0)
-                        });
-                        let i = (y as usize * w as usize + x as usize) * 3;
-                        assert!((fast[i] - slow.0).abs() < 1e-4, "{mode:?} n={n} at {x},{y}");
-                        assert!((fast[i + 1] - slow.1).abs() < 1e-4);
-                        assert!((fast[i + 2] - slow.2).abs() < 1e-4);
+        // a sub-rectangle touching the left/top edge, and the whole image
+        for (rx0, ry0, rx1, ry1) in [(-4, -3, 9, 8), (0, 0, w as i32, h as i32), (15, 10, 40, 30)] {
+            for mode in PoolMode::ALL {
+                for n in [3u32, 5, 15] {
+                    let mut e = DynamicEffects::default();
+                    e.sample_size = n;
+                    e.pooling = mode;
+                    let fast = pool_region(&bg, rx0, ry0, rx1, ry1, n as i32, mode);
+                    for y in fast.y0..fast.y0 + fast.h {
+                        for x in fast.x0..fast.x0 + fast.w {
+                            let slow = e.pool(x, y, |sx, sy| {
+                                let p = bg.get_pixel(sx.clamp(0, w as i32 - 1) as u32, sy.clamp(0, h as i32 - 1) as u32);
+                                (p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0)
+                            });
+                            let got = fast.get(x, y).unwrap();
+                            assert!((got.0 - slow.0).abs() < 1e-4, "{mode:?} n={n} at {x},{y}");
+                            assert!((got.1 - slow.1).abs() < 1e-4);
+                            assert!((got.2 - slow.2).abs() < 1e-4);
+                        }
                     }
                 }
             }
