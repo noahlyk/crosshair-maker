@@ -509,48 +509,46 @@ pub fn generate_svg(extent_x: u32, extent_y: u32, pieces: &[Piece]) -> String {
     svg
 }
 
+/// True when the piece's fill is not fully opaque.
+fn is_translucent(piece: &Piece) -> bool {
+    let c = piece.base_color();
+    match c.strip_prefix('#') {
+        Some(hex) if hex.len() == 8 => u8::from_str_radix(&hex[6..8], 16).map_or(false, |a| a < 255),
+        _ => false,
+    }
+}
+
 /// Shared piece rendering logic used by both `generate_svg` and `generate_svg_scaled`.
+///
+/// Pieces are composited bottom-to-top with "replace" semantics: an eraser or
+/// dynamic piece, and any translucent piece, first cuts its own shape out of
+/// everything drawn so far, then (unless it is an eraser) draws itself.  Opaque
+/// pieces simply paint over what is below.
 fn render_pieces_to_svg(svg: &mut String, width: i32, height: i32, cx: i32, cy: i32, expanded: &[Piece]) {
-    // Layer-by-layer rendering: each eraser only erases pieces before it
-    let mut pending_pieces: Vec<&Piece> = Vec::new();
+    let mut body = String::new();
     let mut mask_counter: u32 = 0;
 
     for piece in expanded {
-        if is_eraser(piece) {
-            // Draw pending pieces with current mask
-            if !pending_pieces.is_empty() {
-                mask_counter += 1;
-                let mask_id = format!("em{}", mask_counter);
-                write!(svg, r#"<defs><mask id="{mask_id}" maskUnits="userSpaceOnUse" x="0" y="0" width="{width}" height="{height}">"#).unwrap();
-                write!(svg, r#"<rect x="0" y="0" width="{width}" height="{height}" fill="white"/>"#).unwrap();
-
-                let mut eraser_piece = piece.clone();
-                eraser_piece.set_color_override("#000000ff");
-                draw_piece(svg, cx, cy, &eraser_piece);
-
-                svg.push_str("</mask></defs>");
-                write!(svg, r#"<g mask="url(#{mask_id})">"#).unwrap();
-
-                for p in &pending_pieces {
-                    draw_piece(svg, cx, cy, p);
-                }
-                svg.push_str("</g>");
-                pending_pieces.clear();
-            }
-
-            // Also draw the eraser piece itself (if it's dynamic, with its color)
-            if is_dynamic(piece) {
-                draw_piece(svg, cx, cy, piece);
-            }
-        } else {
-            pending_pieces.push(piece);
+        let erases = is_eraser(piece) || (piece.is_visible() && is_translucent(piece));
+        if erases && !body.is_empty() {
+            mask_counter += 1;
+            let mask_id = format!("em{}", mask_counter);
+            let mut cut = String::new();
+            write!(cut, r#"<defs><mask id="{mask_id}" maskUnits="userSpaceOnUse" x="0" y="0" width="{width}" height="{height}">"#).unwrap();
+            write!(cut, r#"<rect x="0" y="0" width="{width}" height="{height}" fill="white"/>"#).unwrap();
+            let mut eraser_piece = piece.clone();
+            eraser_piece.set_color_override("#000000ff");
+            draw_piece(&mut cut, cx, cy, &eraser_piece);
+            cut.push_str("</mask></defs>");
+            write!(cut, r#"<g mask="url(#{mask_id})">"#).unwrap();
+            cut.push_str(&body);
+            cut.push_str("</g>");
+            body = cut;
+        }
+        // Erasers draw nothing, except Dynamic ones which draw with their own color.
+        if !is_eraser(piece) || is_dynamic(piece) {
+            draw_piece(&mut body, cx, cy, piece);
         }
     }
-
-    // Draw remaining pieces without mask
-    if !pending_pieces.is_empty() {
-        for p in &pending_pieces {
-            draw_piece(svg, cx, cy, p);
-        }
-    }
+    svg.push_str(&body);
 }

@@ -504,6 +504,24 @@ fn is_dynamic(piece: &Piece) -> bool {
     matches!(piece.color_type(), crate::types::ColorType::Dynamic { .. })
 }
 
+/// Pieces for rendering the dynamic mask: Dynamic pieces are white, every other
+/// piece is opaque black so anything layered above a Dynamic piece cuts it out.
+/// Read the result's red channel (white = apply effects).
+fn dynamic_mask_pieces(pieces: &[Piece]) -> Vec<Piece> {
+    pieces
+        .iter()
+        .map(|p| {
+            let mut mp = p.clone();
+            if is_dynamic(p) {
+                mp.set_color_override("#ffffffff");
+            } else {
+                mp.set_color_override("#000000ff");
+            }
+            mp
+        })
+        .collect()
+}
+
 /// Save dynamic mask + config file.
 ///
 /// Exports:
@@ -541,20 +559,12 @@ fn save_dynamic_export(
     let h = extent_y as u32 * 2;
 
     // Build binary mask: Dynamic pieces = white, everything else = hidden
-    let mask_pieces: Vec<Piece> = pieces.iter().map(|p| {
-        let mut mp = p.clone();
-        if is_dynamic(p) {
-            mp.set_color_override("#ffffffff"); // white = apply effects
-        } else {
-            mp.set_visible(false);
-        }
-        mp
-    }).collect();
+    let mask_pieces = dynamic_mask_pieces(pieces);
 
     let svg = generate_svg(extent_x.cast_unsigned(), extent_y.cast_unsigned(), &mask_pieces);
     if let Some(rgba_data) = rasterize_svg(&svg, w, h) {
         // Convert RGBA to grayscale (take alpha channel as the mask value)
-        let gray: Vec<u8> = rgba_data.chunks(4).map(|px| px[3]).collect();
+        let gray: Vec<u8> = rgba_data.chunks(4).map(|px| px[0]).collect();
         let tmp = json_path.with_file_name(format!("{stem}.dynamic.tmp.png"));
         if image::save_buffer(&tmp, &gray, w, h, image::ColorType::L8).is_ok() {
             let _ = std::fs::rename(&tmp, &mask_path);
@@ -940,15 +950,7 @@ pub fn render_preview_panel(
 
                 // Rasterize binary mask (dynamic pieces = white, rest hidden)
                 let mask_rgba = if has_dynamic && effects.has_any_enabled() {
-                    let mask_pieces: Vec<Piece> = pieces.iter().map(|p| {
-                        let mut mp = p.clone();
-                        if is_dynamic(p) {
-                            mp.set_color_override("#ffffffff");
-                        } else {
-                            mp.set_visible(false);
-                        }
-                        mp
-                    }).collect();
+                    let mask_pieces = dynamic_mask_pieces(pieces);
                     let svg = if sn != 1 || sd != 1 {
                         generate_svg_scaled(ext_x, ext_y, &mask_pieces, sn, sd)
                     } else {
@@ -998,7 +1000,7 @@ pub fn render_preview_panel(
                             //    grid so the effect honestly represents native resolution.
                             if let Some(ref mask) = mask_rgba {
                                 if ci + 3 < mask.len() {
-                                    let mask_alpha = mask[ci + 3] as f32 / 255.0;
+                                    let mask_alpha = mask[ci] as f32 / 255.0;
                                     if mask_alpha > 0.001 {
                                     let (dr, dg, db) = if is_scaled {
                                         // Quantize to native crosshair pixel grid
@@ -1114,15 +1116,7 @@ pub fn render_preview_panel(
             };
 
             let mask_rgba = {
-                let mask_pieces: Vec<Piece> = pieces.iter().map(|p| {
-                    let mut mp = p.clone();
-                    if is_dynamic(p) {
-                        mp.set_color_override("#ffffffff");
-                    } else {
-                        mp.set_visible(false);
-                    }
-                    mp
-                }).collect();
+                let mask_pieces = dynamic_mask_pieces(pieces);
                 let svg = generate_svg(ext_x, ext_y, &mask_pieces);
                 rasterize_svg(&svg, raster_w, raster_h)
             };
@@ -1137,7 +1131,7 @@ pub fn render_preview_panel(
 
                         if let Some(ref mask) = mask_rgba {
                             if pi + 3 < mask.len() {
-                                let mask_alpha = mask[pi + 3] as f32 / 255.0;
+                                let mask_alpha = mask[pi] as f32 / 255.0;
                                 if mask_alpha > 0.001 {
                                 let (er, eg, eb) = effects.apply_to_pixel(
                                     pr as f32 / 255.0,
@@ -1245,5 +1239,64 @@ pub fn render_preview_panel(
             ui.painter().rect_filled(rect, egui::CornerRadius::ZERO, egui::Color32::from_gray(20));
             ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "No preview available", egui::FontId::default(), egui::Color32::GRAY);
         }
+    }
+}
+
+#[cfg(test)]
+mod layering_tests {
+    use super::*;
+    use crate::types::{default_cross_piece, ColorType};
+
+    fn cross(color: &str, dynamic: bool) -> Piece {
+        let mut p = default_cross_piece();
+        p.set_color_override(color);
+        if dynamic {
+            if let Piece::Cross { color_type, .. } = &mut p {
+                *color_type = ColorType::Dynamic {
+                    _legacy_mode: None,
+                    _legacy_modes: None,
+                    _legacy_tint: None,
+                    _legacy_strength: None,
+                };
+            }
+        }
+        p
+    }
+
+    fn render(pieces: &[Piece]) -> Vec<u8> {
+        let svg = generate_svg(20, 20, pieces);
+        rasterize_svg(&svg, 40, 40).unwrap()
+    }
+
+    #[test]
+    fn solid_above_dynamic_cuts_the_mask() {
+        let dyn_only = render(&dynamic_mask_pieces(&[cross("#ff0000ff", true)]));
+        let covered = render(&dynamic_mask_pieces(&[cross("#ff0000ff", true), cross("#00ff00ff", false)]));
+        assert!(dyn_only.chunks(4).any(|p| p[0] == 255));
+        assert!(covered.chunks(4).all(|p| p[0] == 0));
+    }
+
+    #[test]
+    fn dynamic_above_solid_erases_it() {
+        let pieces = [cross("#00ff00ff", false), cross("#ff0000ff", true)];
+        let eff = apply_color_override_for_export(&pieces, 0.0);
+        assert!(render(&eff).chunks(4).all(|p| p[3] == 0));
+    }
+
+    #[test]
+    fn translucent_replaces_what_is_below() {
+        let one = render(&[cross("#0000ff80", false)]);
+        let two = render(&[cross("#ff0000ff", false), cross("#0000ff80", false)]);
+        assert_eq!(one, two);
+    }
+
+    #[test]
+    fn later_eraser_erases_earlier_layers() {
+        let mut e = cross("#000000ff", false);
+        if let Piece::Cross { color_type, .. } = &mut e {
+            *color_type = ColorType::Eraser;
+        }
+        let pieces = [cross("#ff0000ff", false), e.clone(), cross("#00ff00ff", false), e];
+        assert!(render(&pieces).chunks(4).all(|p| p[3] == 0));
     }
 }

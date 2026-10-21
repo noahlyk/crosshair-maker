@@ -670,7 +670,7 @@ impl Piece {
         }
     }
 
-    fn base_color(&self) -> String {
+    pub fn base_color(&self) -> String {
         match self {
             Piece::Cross { color, .. }
             | Piece::Dot { color, .. }
