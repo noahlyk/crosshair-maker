@@ -541,6 +541,37 @@ pub fn edit_dynamic_effects(ui: &mut egui::Ui, effects: &mut DynamicEffects) -> 
 
     // Overall opacity
     changed |= slider_f64_fine(ui, &mut effects.opacity, 0.0..=1.0, "Opacity", 0.01);
+
+    // Sample area: pool the area under each pixel into one color before the effects run
+    let mut size = effects.sample_size_odd();
+    ui.horizontal(|ui| {
+        ui.label("Sample Size");
+        let mut step = (size - 1) / 2;
+        if ui
+            .add(egui::Slider::new(&mut step, 0..=(crate::types::MAX_SAMPLE_SIZE - 1) / 2)
+                .custom_formatter(|v, _| { let n = v as u32 * 2 + 1; format!("{n}x{n}") })
+                .custom_parser(|s| s.split('x').next().and_then(|n| n.trim().parse::<f64>().ok()).map(|n| ((n - 1.0) / 2.0).max(0.0))))
+            .on_hover_text("1 = only the pixel behind. Larger = pool the surrounding NxN pixels into one color first.")
+            .changed()
+        {
+            size = step * 2 + 1;
+            changed = true;
+        }
+    });
+    effects.sample_size = size;
+    if size > 1 {
+        ui.indent("eff_pooling", |ui| {
+            egui::ComboBox::from_label("Pooling")
+                .selected_text(effects.pooling.label())
+                .show_ui(ui, |ui| {
+                    for m in crate::types::PoolMode::ALL {
+                        if ui.selectable_value(&mut effects.pooling, m, m.label()).changed() {
+                            changed = true;
+                        }
+                    }
+                });
+        });
+    }
     ui.separator();
 
     // Invert

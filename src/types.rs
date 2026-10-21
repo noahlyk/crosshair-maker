@@ -32,6 +32,50 @@ pub struct DynamicEffects {
     /// Overall opacity of the dynamic effect (0.0 = invisible, 1.0 = full).
     #[serde(default = "default_one")]
     pub opacity: f64,
+    /// Width of the square area of the game image (centered on each pixel)
+    /// that is pooled into one color before the effects run.  Odd, 1 = just
+    /// the pixel behind it.
+    #[serde(default = "default_sample_size")]
+    pub sample_size: u32,
+    /// How the sample area is pooled into one color (ignored when size is 1).
+    #[serde(default)]
+    pub pooling: PoolMode,
+}
+
+fn default_sample_size() -> u32 { 1 }
+
+pub const MAX_SAMPLE_SIZE: u32 = 15;
+
+/// How the pixels of the sample area are combined into one color.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PoolMode {
+    /// Mean color of the area.
+    #[default]
+    Average,
+    /// Per-channel brightest value.
+    Max,
+    /// Per-channel darkest value.
+    Min,
+}
+
+impl PoolMode {
+    pub const ALL: [PoolMode; 3] = [PoolMode::Average, PoolMode::Max, PoolMode::Min];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PoolMode::Average => "Average",
+            PoolMode::Max => "Max (brightest)",
+            PoolMode::Min => "Min (darkest)",
+        }
+    }
+
+    pub fn cfg_name(self) -> &'static str {
+        match self {
+            PoolMode::Average => "average",
+            PoolMode::Max => "max",
+            PoolMode::Min => "min",
+        }
+    }
 }
 
 impl Default for DynamicEffects {
@@ -45,6 +89,8 @@ impl Default for DynamicEffects {
             hue_rotate: EffectHueRotate { enabled: false, strength: 1.0, angle: 180.0 },
             saturate: EffectSaturate { enabled: false, strength: 1.0, amount: 1.0 },
             opacity: 1.0,
+            sample_size: 1,
+            pooling: PoolMode::Average,
         }
     }
 }
@@ -88,7 +134,47 @@ impl DynamicEffects {
         if self.opacity < 1.0 {
             s.push_str(&format!("opacity {:.4}\n", self.opacity));
         }
+        if self.sample_size > 1 {
+            s.push_str(&format!("sample {} {}\n", self.sample_size_odd(), self.pooling.cfg_name()));
+        }
         s
+    }
+
+    /// Sample size clamped to an odd value in 1..=MAX_SAMPLE_SIZE.
+    pub fn sample_size_odd(&self) -> u32 {
+        let n = self.sample_size.clamp(1, MAX_SAMPLE_SIZE);
+        if n % 2 == 0 { n - 1 } else { n }
+    }
+
+    /// Pool the `sample_size` x `sample_size` area centered on `(x, y)` into one
+    /// color.  `get` returns the RGB (0..1) at a coordinate; coordinates are
+    /// clamped by the caller.
+    pub fn pool(&self, x: i32, y: i32, get: impl Fn(i32, i32) -> (f32, f32, f32)) -> (f32, f32, f32) {
+        let n = self.sample_size_odd() as i32;
+        if n <= 1 {
+            return get(x, y);
+        }
+        let r = n / 2;
+        let mut acc = match self.pooling {
+            PoolMode::Average => (0.0, 0.0, 0.0),
+            PoolMode::Max => (0.0, 0.0, 0.0),
+            PoolMode::Min => (1.0, 1.0, 1.0),
+        };
+        for dy in -r..=r {
+            for dx in -r..=r {
+                let p = get(x + dx, y + dy);
+                acc = match self.pooling {
+                    PoolMode::Average => (acc.0 + p.0, acc.1 + p.1, acc.2 + p.2),
+                    PoolMode::Max => (acc.0.max(p.0), acc.1.max(p.1), acc.2.max(p.2)),
+                    PoolMode::Min => (acc.0.min(p.0), acc.1.min(p.1), acc.2.min(p.2)),
+                };
+            }
+        }
+        if self.pooling == PoolMode::Average {
+            let k = (n * n) as f32;
+            acc = (acc.0 / k, acc.1 / k, acc.2 / k);
+        }
+        acc
     }
 
     /// Apply the effect chain to an RGB pixel (CPU-side, for live preview).
@@ -860,3 +946,34 @@ pub fn default_cross_piece() -> Piece {
 pub const ALL_LEGACY_MODE_TAGS: &[&str] = &[
     "invert", "dodge", "burn", "complement", "lumainvert", "huerotate", "saturate",
 ];
+
+#[cfg(test)]
+mod pooling_tests {
+    use super::*;
+
+    // 3x3 area: center pixel is 0.9, the rest 0.0 except one 0.3.
+    fn get(x: i32, y: i32) -> (f32, f32, f32) {
+        let v = match (x, y) {
+            (5, 5) => 0.9,
+            (6, 5) => 0.3,
+            _ => 0.0,
+        };
+        (v, v, v)
+    }
+
+    #[test]
+    fn pooling_modes() {
+        let mut e = DynamicEffects::default();
+        assert_eq!(e.pool(5, 5, get).0, 0.9); // size 1 = raw pixel
+        assert!(!e.to_cfg_string().contains("sample"));
+        e.sample_size = 3;
+        assert!((e.pool(5, 5, get).0 - 1.2 / 9.0).abs() < 1e-6);
+        e.pooling = PoolMode::Max;
+        assert_eq!(e.pool(5, 5, get).0, 0.9);
+        e.pooling = PoolMode::Min;
+        assert_eq!(e.pool(5, 5, get).0, 0.0);
+        assert!(e.to_cfg_string().contains("sample 3 min"));
+        e.sample_size = 4; // even rounds down to odd
+        assert_eq!(e.sample_size_odd(), 3);
+    }
+}

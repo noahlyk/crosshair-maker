@@ -1013,12 +1013,11 @@ pub fn render_preview_panel(
                                         let sbx = ((snapped_cx - bg_ox as f32) / zoom) as i32;
                                         let sby = ((snapped_cy - bg_oy as f32) / zoom) as i32;
                                         if sbx >= 0 && sby >= 0 && sbx < bg_w as i32 && sby < bg_h as i32 {
-                                            let spx = bg.get_pixel(sbx as u32, sby as u32);
-                                            effects.apply_to_pixel(
-                                                spx[0] as f32 / 255.0,
-                                                spx[1] as f32 / 255.0,
-                                                spx[2] as f32 / 255.0,
-                                            )
+                                            let (r, g, b) = effects.pool(sbx, sby, |x, y| {
+                                                let spx = bg.get_pixel(x.clamp(0, bg_w as i32 - 1) as u32, y.clamp(0, bg_h as i32 - 1) as u32);
+                                                (spx[0] as f32 / 255.0, spx[1] as f32 / 255.0, spx[2] as f32 / 255.0)
+                                            });
+                                            effects.apply_to_pixel(r, g, b)
                                         } else {
                                             effects.apply_to_pixel(
                                                 20.0 / 255.0,
@@ -1026,6 +1025,12 @@ pub fn render_preview_panel(
                                                 20.0 / 255.0,
                                             )
                                         }
+                                    } else if bx >= 0 && by >= 0 && bx < bg_w as i32 && by < bg_h as i32 {
+                                        let (r, g, b) = effects.pool(bx, by, |x, y| {
+                                            let spx = bg.get_pixel(x.clamp(0, bg_w as i32 - 1) as u32, y.clamp(0, bg_h as i32 - 1) as u32);
+                                            (spx[0] as f32 / 255.0, spx[1] as f32 / 255.0, spx[2] as f32 / 255.0)
+                                        });
+                                        effects.apply_to_pixel(r, g, b)
                                     } else {
                                         effects.apply_to_pixel(
                                             pr as f32 / 255.0,
