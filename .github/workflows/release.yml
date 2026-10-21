@@ -91,6 +91,8 @@ jobs:
           sed -i "s/pkgver=.*/pkgver=$VERSION/" PKGBUILD
           sed -i "s/pkgver=.*/pkgver=$VERSION/" aur/PKGBUILD
           sed -i "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+          # keep Cargo.lock in sync so `cargo build --locked` (PKGBUILD) works
+          cargo update -w
       - name: Create tarball
         run: |
           ARCH_NAME=${{ steps.arch.outputs.arch_name }}
@@ -108,6 +110,7 @@ jobs:
             PKGBUILD
             aur/
             Cargo.toml
+            Cargo.lock
             crosshair-maker-*.tar.gz
             crosshair-maker-*.sha256
 
@@ -139,7 +142,7 @@ jobs:
       - name: Commit version bump and tag
         run: |
           VERSION=${{ needs.version.outputs.new_version }}
-          git add PKGBUILD aur/ Cargo.toml
+          git add PKGBUILD aur/ Cargo.toml Cargo.lock
           git commit -m "chore: bump version to v${VERSION}" || echo "No changes to commit"
           git tag "v${VERSION}" -f
           git push origin main
