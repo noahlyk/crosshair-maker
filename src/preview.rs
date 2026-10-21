@@ -35,6 +35,10 @@ pub struct PreviewState {
     bg_image: Option<(PreviewBackground, image::RgbaImage)>,
     /// Composite texture (background + crosshair + effects).
     composite_texture: Option<egui::TextureHandle>,
+    /// Hash of everything the composite depends on; unchanged = reuse the texture.
+    composite_key: u64,
+    /// Rasterized crosshair + dynamic masks for the current pieces and scale.
+    raster_cache: Option<std::rc::Rc<RasterCache>>,
     /// Zoom level (1.0 = default).
     zoom_level: f32,
     /// Crosshair scale as (numerator, denominator) for clean integer scaling.
@@ -45,6 +49,23 @@ pub struct PreviewState {
     pub honest_pixels: bool,
     /// Background pan offset (pixels in composite space).
     bg_pan: egui::Vec2,
+}
+
+/// Rasterized layers of the live preview.  Rendering the (scaled) SVGs is the
+/// expensive part, so they are redone only when the pieces, scale or size change.
+struct RasterCache {
+    key: u64,
+    crosshair_rgba: Option<Vec<u8>>,
+    masks: Vec<(crate::types::DynamicEffects, Vec<u8>)>,
+}
+
+fn hash_of(parts: &[&dyn std::fmt::Debug]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for p in parts {
+        format!("{p:?}").hash(&mut h);
+    }
+    h.finish()
 }
 
 impl PreviewState {
@@ -59,6 +80,8 @@ impl PreviewState {
             selected_bg: PreviewBackground::None,
             bg_image: None,
             composite_texture: None,
+            composite_key: 0,
+            raster_cache: None,
             zoom_level: 1.0,
             crosshair_scale: (1, 1),
             honest_pixels: true,
@@ -972,30 +995,47 @@ pub fn render_preview_panel(
                 let raster_w = ch_w.min(max_size);
                 let raster_h = ch_h.min(max_size);
 
-                // Rasterize crosshair for export (dynamic → transparent, keeps piece order)
-                let crosshair_rgba = {
-                    let eff = apply_color_override_for_export(pieces, frame);
-                    let svg = if sn != 1 || sd != 1 {
-                        generate_svg_scaled(ext_x, ext_y, &eff, sn, sd)
-                    } else {
-                        generate_svg(ext_x, ext_y, &eff)
-                    };
-                    rasterize_svg(&svg, raster_w, raster_h)
-                };
-
-                // Rasterize binary mask (dynamic pieces = white, rest hidden)
-                let masks: Vec<(&crate::types::DynamicEffects, Vec<u8>)> = active
-                    .iter()
-                    .filter_map(|(id, effects)| {
-                        let mask_pieces = dynamic_mask_pieces(pieces, *id);
+                // Rasterize crosshair + masks, reusing the last result while
+                // pieces, scale and size are unchanged (the SVG work is what
+                // gets slow at large scales).
+                let animated = pieces.iter().any(has_animated_color);
+                let raster_key = hash_of(&[
+                    &serde_json::to_string(pieces).unwrap_or_default(),
+                    &serde_json::to_string(groups).unwrap_or_default(),
+                    &(sn, sd, ext_x, ext_y, raster_w, raster_h),
+                    &animated.then(|| frame.to_bits()),
+                ]);
+                if preview.raster_cache.as_ref().map(|c| c.key) != Some(raster_key) {
+                    let crosshair_rgba = {
+                        let eff = apply_color_override_for_export(pieces, frame);
                         let svg = if sn != 1 || sd != 1 {
-                            generate_svg_scaled(ext_x, ext_y, &mask_pieces, sn, sd)
+                            generate_svg_scaled(ext_x, ext_y, &eff, sn, sd)
                         } else {
-                            generate_svg(ext_x, ext_y, &mask_pieces)
+                            generate_svg(ext_x, ext_y, &eff)
                         };
-                        rasterize_svg(&svg, raster_w, raster_h).map(|m| (*effects, m))
-                    })
-                    .collect();
+                        rasterize_svg(&svg, raster_w, raster_h)
+                    };
+                    let masks = active
+                        .iter()
+                        .filter_map(|(id, effects)| {
+                            let mask_pieces = dynamic_mask_pieces(pieces, *id);
+                            let svg = if sn != 1 || sd != 1 {
+                                generate_svg_scaled(ext_x, ext_y, &mask_pieces, sn, sd)
+                            } else {
+                                generate_svg(ext_x, ext_y, &mask_pieces)
+                            };
+                            rasterize_svg(&svg, raster_w, raster_h).map(|m| ((*effects).clone(), m))
+                        })
+                        .collect();
+                    preview.raster_cache = Some(std::rc::Rc::new(RasterCache {
+                        key: raster_key,
+                        crosshair_rgba,
+                        masks,
+                    }));
+                }
+                let raster = preview.raster_cache.clone().expect("raster cache just filled");
+                let crosshair_rgba = &raster.crosshair_rgba;
+                let masks_vec = &raster.masks;
 
                 let actual_ch_w = raster_w;
                 let actual_ch_h = raster_h;
@@ -1007,7 +1047,27 @@ pub fn render_preview_panel(
                 let scale_ratio = sn as f32 / sd as f32;
                 let is_scaled = sn != sd && preview.honest_pixels;
 
+                // Nothing the composite depends on changed (e.g. the mouse is
+                // still): keep the texture instead of redoing every pixel.
+                let composite_key = hash_of(&[
+                    &raster_key,
+                    &(composite_w, composite_h, ch_ox, ch_oy, bg_ox, bg_oy),
+                    &(zoom.to_bits(), is_scaled, scale_ratio.to_bits()),
+                    &preview.selected_bg.label(),
+                ]);
+                let reuse = composite_key == preview.composite_key
+                    && preview.composite_texture.as_ref().is_some_and(|t| {
+                        t.size() == [composite_w as usize, composite_h as usize]
+                    });
+                let tex = if reuse {
+                    preview.composite_texture.clone().expect("checked above")
+                } else {
+                preview.composite_key = composite_key;
                 // Build composite: background (zoomed) → dynamic effects → crosshair overlay (native)
+                // Honest-pixels mode samples one background pixel per native
+                // crosshair pixel, so many composite pixels share one result.
+                let mut native_cache: std::collections::HashMap<(i32, i32, usize), (f32, f32, f32)> =
+                    std::collections::HashMap::new();
                 let mut pixels = vec![0u8; (composite_w * composite_h * 4) as usize];
                 for y in 0..composite_h {
                     for x in 0..composite_w {
@@ -1034,7 +1094,7 @@ pub fn render_preview_panel(
                             // 2. Dynamic effects (where mask is white, transform bg pixel)
                             //    When crosshair is scaled, snap bg sample to native pixel
                             //    grid so the effect honestly represents native resolution.
-                            for (effects, mask) in &masks {
+                            for (gi, (effects, mask)) in masks_vec.iter().enumerate() {
                                 if ci + 3 < mask.len() {
                                     let mask_alpha = mask[ci] as f32 / 255.0;
                                     if mask_alpha > 0.001 {
@@ -1042,13 +1102,18 @@ pub fn render_preview_panel(
                                         // Quantize to native crosshair pixel grid
                                         let native_x = (lx as f32 / scale_ratio).floor();
                                         let native_y = (ly as f32 / scale_ratio).floor();
+                                        let memo_key = (native_x as i32, native_y as i32, gi);
+                                        let cached = native_cache.get(&memo_key).copied();
+                                        if let Some(hit) = cached {
+                                            hit
+                                        } else {
                                         // Map native pixel center back to composite space
                                         let snapped_cx = ch_ox as f32 + (native_x + 0.5) * scale_ratio;
                                         let snapped_cy = ch_oy as f32 + (native_y + 0.5) * scale_ratio;
                                         // Sample background at that snapped position
                                         let sbx = ((snapped_cx - bg_ox as f32) / zoom) as i32;
                                         let sby = ((snapped_cy - bg_oy as f32) / zoom) as i32;
-                                        if sbx >= 0 && sby >= 0 && sbx < bg_w as i32 && sby < bg_h as i32 {
+                                        let v = if sbx >= 0 && sby >= 0 && sbx < bg_w as i32 && sby < bg_h as i32 {
                                             let (r, g, b) = effects.pool(sbx, sby, |x, y| {
                                                 let spx = bg.get_pixel(x.clamp(0, bg_w as i32 - 1) as u32, y.clamp(0, bg_h as i32 - 1) as u32);
                                                 (spx[0] as f32 / 255.0, spx[1] as f32 / 255.0, spx[2] as f32 / 255.0)
@@ -1060,6 +1125,9 @@ pub fn render_preview_panel(
                                                 20.0 / 255.0,
                                                 20.0 / 255.0,
                                             )
+                                        };
+                                        native_cache.insert(memo_key, v);
+                                        v
                                         }
                                     } else if bx >= 0 && by >= 0 && bx < bg_w as i32 && by < bg_h as i32 {
                                         let (r, g, b) = effects.pool(bx, by, |x, y| {
@@ -1114,7 +1182,7 @@ pub fn render_preview_panel(
                 );
 
                 // Upload composite texture
-                let tex = match &mut preview.composite_texture {
+                match &mut preview.composite_texture {
                     Some(tex) if tex.size() == image.size => {
                         tex.set_partial([0, 0], image, egui::TextureOptions::NEAREST);
                         tex.clone()
@@ -1124,6 +1192,7 @@ pub fn render_preview_panel(
                         preview.composite_texture = Some(tex.clone());
                         tex
                     }
+                }
                 };
 
                 ui.painter().image(
