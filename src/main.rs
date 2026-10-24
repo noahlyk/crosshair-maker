@@ -813,6 +813,11 @@ impl eframe::App for CrosshairApp {
 }
 
 fn main() -> eframe::Result {
+    if std::env::args().skip(1).any(|arg| arg == "--version" || arg == "-V") {
+        println!("crosshair-maker {}", env!("CROSSHAIR_MAKER_VERSION"));
+        return Ok(());
+    }
+
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])
